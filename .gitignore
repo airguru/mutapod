@@ -1,7 +1,7 @@
 # Build output
-mutapod
-mutapod.exe
-mutapod.exe~
+/mutapod
+/mutapod.exe
+/mutapod.exe~
 
 # Test binaries and stubs
 testbin/
