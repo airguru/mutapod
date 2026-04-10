@@ -1,0 +1,262 @@
+# mutapod
+
+`mutapod` provisions a remote VM, syncs your local project to it with Mutagen, runs `docker compose` on the VM, forwards ports back to your machine, and generates a project-scoped VS Code workspace that points Docker-aware tooling at the remote engine.
+
+The intended workflow is:
+
+- edit code locally
+- run services remotely
+- open the generated `mutapod.code-workspace` in VS Code so the Containers view and integrated terminal talk to the remote Docker daemon for this project only
+- let mutapod manage a project-scoped Docker context without changing your global active context
+
+## Current Status
+
+GCP is the only supported provider today.
+
+## Commands
+
+- `mutapod up`: create or start the VM, sync files, run `docker compose up`, forward ports, configure VS Code workspace integration, start lease tracking, and open VS Code attached to the main container by default
+- `mutapod up local`: same as `mutapod up`, but open the local `mutapod.code-workspace` instead of the attached-container window
+- `mutapod up --build`: same as `mutapod up`, but force `docker compose` to rebuild images before starting services
+- `mutapod reset`: terminate local sync state, delete the current VM, clear local mutapod state, and run `mutapod up` again from scratch
+- `mutapod down`: run `docker compose down`, pause sync and forwards, release this workspace lease, and stop the VM immediately only when idle shutdown is disabled
+- `mutapod destroy`: destroy the VM after an explicit confirmation prompt, warn if other workspace leases are visible on the VM, and clean up local mutapod state
+- `mutapod status`: show the current workspace, provider, VM, and sync state
+- `mutapod ssh`: open an interactive shell on the remote VM
+- `mutapod leases`: show the VM-side mutapod lease records, including last heartbeat and expiry
+
+## Quick Start
+
+1. Install `gcloud` and authenticate it for the target project.
+2. Install Docker locally.
+3. Add a `mutapod.yaml` to your project.
+4. Run `mutapod up`.
+5. If you prefer the local workspace wrapper instead of attached-container mode, run `mutapod up local`.
+6. If you need a fresh image rebuild, use `mutapod up --build`.
+
+Mutagen is downloaded automatically into `~/.mutapod/bin` if it is not already available on `PATH`.
+
+## Example `mutapod.yaml`
+
+```yaml
+name: myapp
+
+provider:
+  type: gcp
+  gcp:
+    project: my-gcp-project
+    zone: europe-west4-a
+
+compose:
+  file: compose-dev.yaml
+  primary_service: web
+  workspace_folder: /app
+  extra_ports: [8080]
+
+idle:
+  enabled: true
+  timeout_minutes: 30
+  check_interval_seconds: 60
+```
+
+## Config Reference
+
+### `name`
+
+Workspace name. This is required.
+
+It is used for:
+
+- the default remote workspace path: `/workspace/<name>`
+- the current cloud instance name, together with your active account token
+- Mutagen session names
+- local state file naming
+- lease file naming on the VM
+
+At the moment, this means one workspace name maps to one VM per account.
+
+### `provider`
+
+`provider.type` is required and must be `gcp`.
+
+#### `provider.gcp`
+
+These settings apply when `provider.type: gcp`.
+
+| Key | Required | Default | Notes |
+| --- | --- | --- | --- |
+| `project` | yes | none | GCP project ID |
+| `zone` | no | `us-central1-a` | Compute Engine zone |
+| `machine_type` | no | `e2-standard-4` | VM machine type |
+| `disk_size_gb` | no | `30` | Boot disk size in GB |
+| `disk_type` | no | `pd-balanced` | Boot disk type |
+| `image_family` | no | `ubuntu-2204-lts` | Base image family |
+| `image_project` | no | `ubuntu-os-cloud` | Image project |
+| `network` | no | empty | Passed through to `gcloud compute instances create --network` |
+| `subnet` | no | empty | Passed through to `--subnet` |
+| `service_account` | no | empty | Passed through to `--service-account` |
+| `tags` | no | empty | Passed through as repeated `--tags` values |
+| `preemptible` | no | `false` | Uses preemptible instances unless `spot` is set |
+| `spot` | no | `false` | Uses `--provisioning-model SPOT` |
+| `labels` | no | `managed-by=mutapod` | GCP instance labels |
+
+For GCP, the SSH login user is derived from `gcloud compute config-ssh` and your local setup. It is intentionally not part of the normal `mutapod.yaml` workflow.
+
+For GCP VM naming, mutapod uses the active account from `gcloud config get-value account`, takes the local part before `@`, and sanitizes it into a cloud-safe token. For example, `pavel.kuriscak@gmail.com` becomes `pavel-kuriscak`, so a workspace named `myapp` becomes `mutapod-pavel-kuriscak-myapp`.
+
+### `sync`
+
+| Key | Required | Default | Notes |
+| --- | --- | --- | --- |
+| `local_path` | no | `.` | Local directory to sync, relative to the config file if not absolute |
+| `remote_path` | no | `/workspace/<name>` | Remote project directory |
+| `mode` | no | `two-way-resolved` | Passed to Mutagen as `--sync-mode` |
+
+For the common case, you can omit `sync` entirely. The defaults already mean:
+
+- sync the current project directory
+- place it at `/workspace/<name>` on the VM
+- use Mutagen `two-way-resolved` mode
+
+### `compose`
+
+| Key | Required | Default | Notes |
+| --- | --- | --- | --- |
+| `file` | no | auto-detect | Relative path to the Compose file. If omitted, mutapod looks for `compose.yaml`, `compose.yml`, `docker-compose.yaml`, or `docker-compose.yml` |
+| `primary_service` | no | empty | Service name to highlight in post-`up` Dev Containers attach instructions |
+| `workspace_folder` | no | inferred when possible | In-container project path for the generated "Attach to Running Container" profile. If omitted, mutapod first tries to infer it from the primary service bind mount or `working_dir` |
+| `extensions` | no | empty | Extra VS Code extension IDs to add to the generated attached-container profile |
+| `copy_local_extensions` | no | `true` | Copies your current local `code --list-extensions` set into the generated attached-container profile |
+| `extra_ports` | no | empty | Additional ports to forward besides those discovered from the Compose file |
+
+`docker compose` is executed remotely from the synced workspace directory.
+
+When `compose.primary_service` and `compose.workspace_folder` are set, mutapod automatically injects a compose override on the remote VM to bind-mount the synced workspace into that service if the base compose file doesn't already do it. This is what enables the intended "edit locally, sync to VM, see changes live in the remote container" workflow even for repos whose compose file wasn't written specifically for mutapod.
+
+By default, `mutapod up` runs:
+
+- `docker compose up -d`
+
+If you want to force an image rebuild for that run, use:
+
+- `mutapod up --build`
+- `mutapod up local --build`
+
+This is also how you point mutapod at a dedicated development stack, for example:
+
+```yaml
+compose:
+  file: compose-dev.yaml
+  primary_service: web
+  workspace_folder: /app
+```
+
+That works well for setups where `compose-dev.yaml` starts multiple dev-only services such as:
+
+- a web container where you manually run `python manage.py runserver`
+- a webpack container running in watch mode
+
+When `primary_service` is set, `mutapod up` also pre-generates the VS Code attached-container profile for that service. By default this profile:
+
+- uses `workspace_folder` when set
+- otherwise tries to infer the folder from the service bind mount or `working_dir`
+- copies your currently installed local VS Code extensions
+- merges in any extra IDs from `compose.extensions`
+
+### `profiles`
+
+`profiles` lets mutapod detect selected personal AI-agent setups on your machine, sync their data outside the repo workspace, and bootstrap matching CLIs inside the primary container automatically.
+
+In the normal case, you do not need to configure this section at all.
+
+If `codex` or `claude` is installed locally and available on your `PATH`, mutapod will:
+
+- detect it automatically
+- sync its local home directory if present
+- mount that data into the primary container
+- install the matching CLI inside the primary container automatically on `mutapod up`
+
+Supported keys today:
+
+| Key | Required | Default | Notes |
+| --- | --- | --- | --- |
+| `codex.enabled` | no | auto-detect | If omitted, enabled when `~/.codex` exists locally |
+| `codex.local_path` | no | `~/.codex` | Override the local Codex home to sync |
+| `codex.remote_path` | no | `/var/lib/mutapod/profiles/codex` | Remote VM directory used as the sync target |
+| `codex.mount_path` | no | `/root/.codex` | Container mount path |
+| `claude.enabled` | no | auto-detect | If omitted, enabled when `~/.claude` exists locally |
+| `claude.local_path` | no | `~/.claude` | Override the local Claude home to sync |
+| `claude.remote_path` | no | `/var/lib/mutapod/profiles/claude` | Remote VM directory used as the sync target |
+| `claude.mount_path` | no | `/root/.claude` | Container mount path |
+
+Behavior:
+
+- mutapod auto-enables Codex when local `codex` is installed
+- mutapod auto-enables Claude Code when local `claude` is installed
+- mutapod creates extra Mutagen sync sessions for the enabled profiles when local profile data exists
+- these syncs are separate from the project workspace sync
+- when `compose.primary_service` is set, mutapod mounts the synced profile directories into that service through the generated remote compose override
+- mutapod also creates a persistent tool directory on the VM for each active profile and installs the corresponding CLI in the primary container automatically
+- Codex is launched through a wrapper that exports `CODEX_HOME` to the mounted profile data automatically
+- Claude Code is launched through a wrapper that gives it a stable managed `HOME`, so its `~/.claude` data comes from the mounted profile automatically
+
+Current limitations:
+
+- GitHub Copilot state is not part of this first pass
+- the automatic remote install currently targets Node-based Codex and Claude Code CLIs
+- if your primary container image cannot install Node.js/npm with `apt`, `apk`, `dnf`, or `yum`, mutapod will fail during profile bootstrap and you will need a project-specific container image setup
+
+### `idle`
+
+| Key | Required | Default | Notes |
+| --- | --- | --- | --- |
+| `enabled` | no | `true` | Enables VM-side idle shutdown enforcement |
+| `timeout_minutes` | no | `30` | Lease lifetime and idle timeout window |
+| `check_interval_seconds` | no | `60` | Heartbeat interval and systemd timer cadence |
+
+Important behavior:
+
+- mutapod now writes VM-side lease records even when `idle.enabled: false`
+- when `idle.enabled: true`, the VM is stopped by the remote idle checker only after all leases expire
+- when `idle.enabled: false`, leases are still useful for visibility through `mutapod leases`, but `mutapod down` stops the VM immediately after releasing this workspace lease
+
+Lease records live on the VM under `/var/lib/mutapod/leases`.
+
+## VS Code Integration
+
+`mutapod up` generates `mutapod.code-workspace` in the project root and now opens VS Code attached to the main container by default.
+
+If you want the local workspace wrapper instead, run:
+
+- `mutapod up local`
+
+`mutapod up` also creates or updates a named Docker context for the workspace. The generated workspace then points VS Code at that context and keeps terminal access aligned with it.
+
+The generated workspace currently sets a project-scoped Docker context for:
+
+- the Containers extension environment
+- the integrated terminal on Windows
+- the integrated terminal on Linux
+- the integrated terminal on macOS
+
+It also writes `docker.context` and keeps a matching `docker.host` value available for extensions that still consult the host directly.
+
+This keeps the editor local while Docker operations target the remote VM.
+
+## Ignore Rules
+
+If a `.mutapodignore` file exists in the project root, mutapod converts it into Mutagen ignore rules for the sync session.
+
+`mutapod.code-workspace` is also ignored automatically so the local workspace wrapper does not get synced into the remote container and show up as a recursive workspace suggestion during attach.
+
+Important details:
+
+- `.gitignore` is not used as a Mutagen sync rule source.
+- `--ignore-vcs` only ignores VCS directories such as `.git`; it does not import `.gitignore` file patterns.
+- mutapod now creates sync sessions with Mutagen `--no-global-configuration` so your per-user `~/.mutagen.yml` cannot silently override project sync behavior.
+
+## Notes
+
+- Mutagen sync and forward sessions are reused when possible for fast restarts.
+- The VM-side lease registry is the source of truth for shared usage checks.
+- The current VM naming model is one VM per workspace name per account token.

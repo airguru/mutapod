@@ -1,0 +1,26 @@
+# Build output
+mutapod
+mutapod.exe
+mutapod.exe~
+
+# Test binaries and stubs
+testbin/
+
+# Generated VS Code workspace files
+*.code-workspace
+
+# Debug logs
+debug.log
+*.log
+
+# Local state
+.mutapod/
+.gcloud/
+
+# OS
+.DS_Store
+Thumbs.db
+
+testproject/
+.claude/
+.gocache/

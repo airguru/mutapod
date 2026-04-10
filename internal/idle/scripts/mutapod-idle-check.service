@@ -1,0 +1,6 @@
+[Unit]
+Description=Mutapod idle shutdown check
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/mutapod-idle-check

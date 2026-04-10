@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Mutapod idle shutdown check periodically
+
+[Timer]
+OnBootSec=2m
+OnUnitActiveSec=1m
+AccuracySec=30s
+Unit=mutapod-idle-check.service
+
+[Install]
+WantedBy=timers.target
