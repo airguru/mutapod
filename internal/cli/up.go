@@ -148,12 +148,12 @@ func runUpWithConfig(ctx context.Context, cfg *config.Config, launchMode vscode.
 	}
 
 	if ipChanged {
-		ports, err := portsForSessionCleanup(cfg, st)
+		forwardPorts, reversePorts, err := portsForSessionCleanup(cfg, st)
 		if err != nil {
 			return err
 		}
 		shell.Debugf("IP changed (%s -> %s), recreating Mutagen sessions", st.Instance.LastKnownIP, sshCfg.IP)
-		syncMgr.TerminateAllSessions(ctx, ports)
+		syncMgr.TerminateAllSessions(ctx, forwardPorts, reversePorts)
 		for _, profileState := range st.Profiles {
 			if profileState.SessionName == "" {
 				continue
@@ -322,6 +322,16 @@ func runUpWithConfig(ctx context.Context, cfg *config.Config, launchMode vscode.
 		shell.Debugf("remove remote workspace wrapper: %v", err)
 	}
 
+	if len(cfg.Compose.ReverseForwards) > 0 {
+		step("Exposing local services to the remote VM: %v...", cfg.Compose.ReverseForwards)
+		for _, port := range cfg.Compose.ReverseForwards {
+			if err := syncMgr.EnsureReverseForward(ctx, port); err != nil {
+				return fmt.Errorf("reverse forward %d: %w", port, err)
+			}
+		}
+		ok("Local services exposed: %v", cfg.Compose.ReverseForwards)
+	}
+
 	step("Preparing compose overrides...")
 	overrideApplied, err := compose.EnsureRemoteOverride(ctx, prov, cfg, activeProfiles)
 	if err != nil {
@@ -387,13 +397,14 @@ func runUpWithConfig(ctx context.Context, cfg *config.Config, launchMode vscode.
 		IdentityFile: sshCfg.IdentityFile,
 	}
 	st.Sync = state.SyncState{
-		Backend:         "mutagen",
-		SessionName:     syncMgr.SessionName(),
-		LocalPath:       localPath,
-		RemotePath:      cfg.WorkspacePath(),
-		SessionConfig:   sessionConfigSignature,
-		IgnoreSignature: ignoreSignature,
-		ForwardSessions: buildForwardSessionMap(syncMgr, ports),
+		Backend:                "mutagen",
+		SessionName:            syncMgr.SessionName(),
+		LocalPath:              localPath,
+		RemotePath:             cfg.WorkspacePath(),
+		SessionConfig:          sessionConfigSignature,
+		IgnoreSignature:        ignoreSignature,
+		ForwardSessions:        buildForwardSessionMap(syncMgr, ports),
+		ReverseForwardSessions: buildReverseForwardSessionMap(syncMgr, cfg.Compose.ReverseForwards),
 	}
 	st.Profiles = profileStates
 	if err := state.Save(st); err != nil {
@@ -495,13 +506,14 @@ func runDown(_ *cobra.Command, _ []string) error {
 		}
 	}
 
-	composePath, _ := compose.DetectFile(cfg)
-	if composePath != "" {
-		ports, _ := compose.ParsePorts(composePath, cfg.Compose.ExtraPorts)
-		if len(ports) > 0 {
-			step("Pausing port forwards...")
-			syncMgr.PauseAllForwards(ctx, ports)
-		}
+	forwardPorts, reversePorts, _ := portsForSessionCleanup(cfg, st)
+	if len(forwardPorts) > 0 {
+		step("Pausing port forwards...")
+		syncMgr.PauseAllForwards(ctx, forwardPorts)
+	}
+	if len(reversePorts) > 0 {
+		step("Pausing reverse forwards...")
+		syncMgr.PauseAllReverseForwards(ctx, reversePorts)
 	}
 
 	step("Stopping VM...")
@@ -590,9 +602,9 @@ func ok(format string, args ...any) {
 	fmt.Printf("OK "+format+"\n", args...)
 }
 
-func collectPorts(st *state.State) []int {
+func collectPorts(sessions map[string]string) []int {
 	var ports []int
-	for k := range st.Sync.ForwardSessions {
+	for k := range sessions {
 		var p int
 		fmt.Sscanf(k, "%d", &p)
 		if p > 0 {
@@ -602,17 +614,24 @@ func collectPorts(st *state.State) []int {
 	return ports
 }
 
-func portsForSessionCleanup(cfg *config.Config, st *state.State) ([]int, error) {
-	ports := collectPorts(st)
-	if len(ports) > 0 {
-		return ports, nil
+func portsForSessionCleanup(cfg *config.Config, st *state.State) ([]int, []int, error) {
+	forwardPorts := collectPorts(st.Sync.ForwardSessions)
+	if len(forwardPorts) == 0 {
+		composePath, err := compose.DetectFile(cfg)
+		if err != nil {
+			forwardPorts = nil
+		} else {
+			forwardPorts, err = compose.ParsePorts(composePath, cfg.Compose.ExtraPorts)
+			if err != nil {
+				return nil, nil, err
+			}
+		}
 	}
-
-	composePath, err := compose.DetectFile(cfg)
-	if err != nil {
-		return nil, nil
+	reversePorts := collectPorts(st.Sync.ReverseForwardSessions)
+	if len(reversePorts) == 0 {
+		reversePorts = append(reversePorts, cfg.Compose.ReverseForwards...)
 	}
-	return compose.ParsePorts(composePath, cfg.Compose.ExtraPorts)
+	return forwardPorts, reversePorts, nil
 }
 
 func buildForwardSessionMap(syncMgr *mutagensync.Manager, ports []int) map[string]string {
@@ -623,6 +642,18 @@ func buildForwardSessionMap(syncMgr *mutagensync.Manager, ports []int) map[strin
 	forwardSessions := make(map[string]string, len(ports))
 	for _, port := range ports {
 		forwardSessions[fmt.Sprintf("%d", port)] = syncMgr.ForwardSessionName(port)
+	}
+	return forwardSessions
+}
+
+func buildReverseForwardSessionMap(syncMgr *mutagensync.Manager, ports []int) map[string]string {
+	if len(ports) == 0 {
+		return nil
+	}
+
+	forwardSessions := make(map[string]string, len(ports))
+	for _, port := range ports {
+		forwardSessions[fmt.Sprintf("%d", port)] = syncMgr.ReverseForwardSessionName(port)
 	}
 	return forwardSessions
 }

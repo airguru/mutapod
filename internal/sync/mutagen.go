@@ -51,6 +51,11 @@ func (m *Manager) ForwardSessionName(port int) string {
 	return fmt.Sprintf("mutapod-%s-%d", m.cfg.Name, port)
 }
 
+// ReverseForwardSessionName returns the mutagen reverse forward session name for a port.
+func (m *Manager) ReverseForwardSessionName(port int) string {
+	return fmt.Sprintf("mutapod-%s-reverse-%d", m.cfg.Name, port)
+}
+
 // EnsureSync creates or resumes the mutagen sync session.
 // Returns when the session is actively watching for changes.
 func (m *Manager) EnsureSync(ctx context.Context) error {
@@ -301,6 +306,46 @@ func (m *Manager) createForward(ctx context.Context, port int, name string) erro
 	)
 }
 
+// EnsureReverseForward creates or resumes a reverse Mutagen forward session for a port.
+func (m *Manager) EnsureReverseForward(ctx context.Context, port int) error {
+	name := m.ReverseForwardSessionName(port)
+	shell.Debugf("reverse-forward: checking session %s", name)
+
+	status, err := m.forwardStatus(ctx, name)
+	if err != nil {
+		return err
+	}
+
+	switch status {
+	case "connected":
+		shell.Debugf("reverse-forward: session %s already active", name)
+		return nil
+	case "paused":
+		return m.cmd.Run(ctx, shell.RunOptions{}, m.mutagenPath,
+			"forward", "resume", name,
+		)
+	case "":
+		return m.createReverseForward(ctx, port, name)
+	default:
+		_ = m.terminateForwardSession(ctx, name)
+		return m.createReverseForward(ctx, port, name)
+	}
+}
+
+func (m *Manager) createReverseForward(ctx context.Context, port int, name string) error {
+	local := fmt.Sprintf("tcp:localhost:%d", port)
+	remote := fmt.Sprintf("tcp::%d", port)
+	endpoint := fmt.Sprintf("%s@%s", m.sshCfg.User, m.sshCfg.Host)
+
+	return m.cmd.Run(ctx, shell.RunOptions{}, m.mutagenPath,
+		"forward", "create",
+		"--name", name,
+		"--label", "mutapod-name="+m.cfg.Name,
+		endpoint+":"+remote,
+		local,
+	)
+}
+
 // PauseForward pauses a forward session.
 func (m *Manager) PauseForward(ctx context.Context, port int) error {
 	return m.cmd.Run(ctx, shell.RunOptions{}, m.mutagenPath,
@@ -315,11 +360,28 @@ func (m *Manager) PauseAllForwards(ctx context.Context, ports []int) {
 	}
 }
 
-// TerminateAllSessions terminates sync + all forward sessions (for destroy).
-func (m *Manager) TerminateAllSessions(ctx context.Context, ports []int) {
-	_ = m.terminateSyncSession(ctx, m.sessionName)
+// PauseReverseForward pauses a reverse forward session.
+func (m *Manager) PauseReverseForward(ctx context.Context, port int) error {
+	return m.cmd.Run(ctx, shell.RunOptions{}, m.mutagenPath,
+		"forward", "pause", m.ReverseForwardSessionName(port),
+	)
+}
+
+// PauseAllReverseForwards pauses all reverse forward sessions for this workspace.
+func (m *Manager) PauseAllReverseForwards(ctx context.Context, ports []int) {
 	for _, p := range ports {
+		_ = m.PauseReverseForward(ctx, p)
+	}
+}
+
+// TerminateAllSessions terminates sync + all forward sessions (for destroy).
+func (m *Manager) TerminateAllSessions(ctx context.Context, forwardPorts, reversePorts []int) {
+	_ = m.terminateSyncSession(ctx, m.sessionName)
+	for _, p := range forwardPorts {
 		_ = m.terminateForwardSession(ctx, m.ForwardSessionName(p))
+	}
+	for _, p := range reversePorts {
+		_ = m.terminateForwardSession(ctx, m.ReverseForwardSessionName(p))
 	}
 }
 

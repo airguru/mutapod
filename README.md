@@ -132,10 +132,13 @@ For the common case, you can omit `sync` entirely. The defaults already mean:
 | `extensions` | no | empty | Extra VS Code extension IDs to add to the generated attached-container profile |
 | `copy_local_extensions` | no | `true` | Copies your current local `code --list-extensions` set into the generated attached-container profile |
 | `extra_ports` | no | empty | Additional ports to forward besides those discovered from the Compose file |
+| `reverse_forwards` | no | empty | Local machine ports to expose on the remote VM and into the primary container via `host.docker.internal:<port>` |
 
 `docker compose` is executed remotely from the synced workspace directory.
 
 When `compose.primary_service` and `compose.workspace_folder` are set, mutapod automatically injects a compose override on the remote VM to bind-mount the synced workspace into that service if the base compose file doesn't already do it. This is what enables the intended "edit locally, sync to VM, see changes live in the remote container" workflow even for repos whose compose file wasn't written specifically for mutapod.
+
+When `compose.reverse_forwards` is set, mutapod creates reverse Mutagen forwards from the remote VM back to your local machine and injects `host.docker.internal:host-gateway` into the primary service automatically. This lets code inside the main container reach local services on your machine using the same port numbers through `host.docker.internal:<port>`.
 
 By default, `mutapod up` runs:
 

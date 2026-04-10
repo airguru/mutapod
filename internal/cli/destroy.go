@@ -184,11 +184,11 @@ func cleanupLocalWorkspace(ctx context.Context, cfg *config.Config) error {
 	}
 	syncMgr := mutagensync.New(cfg, sshCfg, mutagenPath, shell.DefaultCommander)
 
-	ports, err := portsForSessionCleanup(cfg, st)
+	forwardPorts, reversePorts, err := portsForSessionCleanup(cfg, st)
 	if err != nil {
 		return err
 	}
-	syncMgr.TerminateAllSessions(ctx, ports)
+	syncMgr.TerminateAllSessions(ctx, forwardPorts, reversePorts)
 	for _, profileState := range st.Profiles {
 		if profileState.SessionName == "" {
 			continue

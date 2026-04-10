@@ -100,6 +100,7 @@ compose:
   file: compose-dev.yaml
   primary_service: web
   workspace_folder: /app
+  reverse_forwards: [8154, 8154]
   extensions:
     - ms-python.python
 `)
@@ -115,6 +116,9 @@ compose:
 	}
 	if cfg.Compose.WorkspaceFolder != "/app" {
 		t.Fatalf("compose.workspace_folder: got %q", cfg.Compose.WorkspaceFolder)
+	}
+	if len(cfg.Compose.ReverseForwards) != 1 || cfg.Compose.ReverseForwards[0] != 8154 {
+		t.Fatalf("compose.reverse_forwards: got %v", cfg.Compose.ReverseForwards)
 	}
 	if len(cfg.Compose.Extensions) != 1 || cfg.Compose.Extensions[0] != "ms-python.python" {
 		t.Fatalf("compose.extensions: got %v", cfg.Compose.Extensions)
@@ -225,6 +229,11 @@ func TestLoad_Validation(t *testing.T) {
 			name:    "azure unsupported",
 			yaml:    "name: x\nprovider:\n  type: azure\n",
 			wantErr: `provider type "azure" is not currently supported; use "gcp"`,
+		},
+		{
+			name:    "invalid reverse forward port",
+			yaml:    "name: x\nprovider:\n  type: gcp\n  gcp:\n    project: p\ncompose:\n  reverse_forwards: [0]\n",
+			wantErr: "compose.reverse_forwards contains invalid port 0",
 		},
 	}
 

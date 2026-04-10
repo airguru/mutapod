@@ -48,6 +48,8 @@ type SyncState struct {
 	LastSyncAt      time.Time `json:"last_sync_at,omitempty"`
 	// ForwardSessions holds mutagen forward session names keyed by port number.
 	ForwardSessions map[string]string `json:"forward_sessions,omitempty"`
+	// ReverseForwardSessions holds reverse Mutagen forward session names keyed by port number.
+	ReverseForwardSessions map[string]string `json:"reverse_forward_sessions,omitempty"`
 }
 
 type ProfileSyncState struct {

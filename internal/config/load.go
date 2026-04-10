@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 
 	"gopkg.in/yaml.v3"
 )
@@ -78,6 +79,8 @@ func applyDefaults(cfg *Config) {
 	if cfg.Idle.CheckIntervalSeconds == 0 {
 		cfg.Idle.CheckIntervalSeconds = 60
 	}
+	cfg.Compose.ExtraPorts = dedupePorts(cfg.Compose.ExtraPorts)
+	cfg.Compose.ReverseForwards = dedupePorts(cfg.Compose.ReverseForwards)
 	// Apply GCP defaults
 	if cfg.Provider.Type == "gcp" {
 		gcp := &cfg.Provider.GCP
@@ -122,6 +125,12 @@ func validate(cfg *Config) error {
 	default:
 		return fmt.Errorf("config: unsupported provider type %q (supported: gcp)", cfg.Provider.Type)
 	}
+	if err := validatePorts("compose.extra_ports", cfg.Compose.ExtraPorts); err != nil {
+		return err
+	}
+	if err := validatePorts("compose.reverse_forwards", cfg.Compose.ReverseForwards); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -141,4 +150,29 @@ func (c *Config) LocalSyncPath() (string, error) {
 		p = filepath.Join(c.Dir, p)
 	}
 	return filepath.Abs(p)
+}
+
+func validatePorts(path string, ports []int) error {
+	for _, port := range ports {
+		if port <= 0 || port > 65535 {
+			return fmt.Errorf("config: %s contains invalid port %d", path, port)
+		}
+	}
+	return nil
+}
+
+func dedupePorts(ports []int) []int {
+	if len(ports) == 0 {
+		return nil
+	}
+	seen := make(map[int]bool, len(ports))
+	deduped := make([]int, 0, len(ports))
+	for _, port := range ports {
+		if seen[port] {
+			continue
+		}
+		seen[port] = true
+		deduped = append(deduped, port)
+	}
+	return slices.Clip(deduped)
 }

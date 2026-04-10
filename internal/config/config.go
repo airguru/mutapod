@@ -66,6 +66,7 @@ type ComposeConfig struct {
 	Extensions          []string `yaml:"extensions"`
 	CopyLocalExtensions *bool    `yaml:"copy_local_extensions"`
 	ExtraPorts          []int    `yaml:"extra_ports"`
+	ReverseForwards     []int    `yaml:"reverse_forwards"`
 }
 
 type ProfilesConfig struct {

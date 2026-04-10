@@ -474,3 +474,40 @@ services:
 		t.Fatalf("expected codex tool mount in override: %s", text)
 	}
 }
+
+func TestRenderRemoteOverride_WithReverseForwardsAddsHostDockerInternal(t *testing.T) {
+	dir := t.TempDir()
+	writeCompose(t, dir, "compose.yaml", `
+services:
+  web:
+    image: demo
+`)
+	c := &config.Config{Dir: dir, Name: "test", Compose: config.ComposeConfig{
+		PrimaryService:  "web",
+		ReverseForwards: []int{8154},
+	}, Sync: config.SyncConfig{RemotePath: "/workspace/test"}}
+
+	data, err := renderRemoteOverride(c, nil)
+	if err != nil {
+		t.Fatalf("renderRemoteOverride: %v", err)
+	}
+	text := string(data)
+	if !strings.Contains(text, "host.docker.internal:host-gateway") {
+		t.Fatalf("expected host.docker.internal mapping in override: %s", text)
+	}
+}
+
+func TestNeedsRemoteOverride_WithReverseForwardsRequiresOverride(t *testing.T) {
+	c := &config.Config{Name: "test", Compose: config.ComposeConfig{
+		PrimaryService:  "web",
+		ReverseForwards: []int{8154},
+	}}
+
+	needed, err := NeedsRemoteOverride(c, nil)
+	if err != nil {
+		t.Fatalf("NeedsRemoteOverride: %v", err)
+	}
+	if !needed {
+		t.Fatal("expected reverse forwards to require a remote override")
+	}
+}

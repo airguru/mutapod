@@ -324,7 +324,8 @@ func remoteOverridePath(cfg *config.Config) string {
 
 func renderRemoteOverride(cfg *config.Config, activeProfiles []profiles.Spec) ([]byte, error) {
 	type overrideService struct {
-		Volumes []string `yaml:"volumes,omitempty"`
+		Volumes    []string `yaml:"volumes,omitempty"`
+		ExtraHosts []string `yaml:"extra_hosts,omitempty"`
 	}
 	type overrideFile struct {
 		Services map[string]overrideService `yaml:"services"`
@@ -336,6 +337,7 @@ func renderRemoteOverride(cfg *config.Config, activeProfiles []profiles.Spec) ([
 	}
 
 	volumes := make([]string, 0, 1+len(activeProfiles)*2)
+	extraHosts := make([]string, 0, 1)
 	needsWorkspaceMount, err := NeedsWorkspaceOverride(cfg)
 	if err != nil {
 		return nil, err
@@ -356,14 +358,18 @@ func renderRemoteOverride(cfg *config.Config, activeProfiles []profiles.Spec) ([
 			volumes = append(volumes, filepath.ToSlash(mount.RemotePath)+":"+filepath.ToSlash(mount.ContainerPath))
 		}
 	}
-	if len(volumes) == 0 {
+	if len(cfg.Compose.ReverseForwards) > 0 {
+		extraHosts = append(extraHosts, "host.docker.internal:host-gateway")
+	}
+	if len(volumes) == 0 && len(extraHosts) == 0 {
 		return nil, nil
 	}
 
 	doc := overrideFile{
 		Services: map[string]overrideService{
 			service: {
-				Volumes: volumes,
+				Volumes:    volumes,
+				ExtraHosts: extraHosts,
 			},
 		},
 	}
@@ -385,6 +391,9 @@ func NeedsRemoteOverride(cfg *config.Config, activeProfiles []profiles.Spec) (bo
 		return false, err
 	}
 	if needsWorkspaceMount {
+		return true, nil
+	}
+	if len(cfg.Compose.ReverseForwards) > 0 {
 		return true, nil
 	}
 	for _, profile := range activeProfiles {

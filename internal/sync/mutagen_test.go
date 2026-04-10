@@ -33,10 +33,28 @@ func TestEnsureForward_RecreatesWithForwardTerminate(t *testing.T) {
 	}
 }
 
+func TestEnsureReverseForward_CreatesRemoteListener(t *testing.T) {
+	manager, fake := testManager()
+
+	if err := manager.EnsureReverseForward(context.Background(), 8154); err != nil {
+		t.Fatalf("EnsureReverseForward: %v", err)
+	}
+
+	if !fake.CalledWith("mutagen",
+		"forward", "create",
+		"--name", "mutapod-myapp-reverse-8154",
+		"--label", "mutapod-name=myapp",
+		"alice@example-host:tcp::8154",
+		"tcp:localhost:8154",
+	) {
+		t.Fatalf("expected reverse forward create, got %#v", fake.Calls)
+	}
+}
+
 func TestTerminateAllSessions_UsesMatchingTerminateCommands(t *testing.T) {
 	manager, fake := testManager()
 
-	manager.TerminateAllSessions(context.Background(), []int{5000, 8080})
+	manager.TerminateAllSessions(context.Background(), []int{5000, 8080}, []int{8154})
 
 	if !fake.CalledWith("mutagen", "sync", "terminate", "mutapod-myapp") {
 		t.Fatal("expected sync terminate for the sync session")
@@ -46,6 +64,9 @@ func TestTerminateAllSessions_UsesMatchingTerminateCommands(t *testing.T) {
 	}
 	if !fake.CalledWith("mutagen", "forward", "terminate", "mutapod-myapp-8080") {
 		t.Fatal("expected forward terminate for port 8080")
+	}
+	if !fake.CalledWith("mutagen", "forward", "terminate", "mutapod-myapp-reverse-8154") {
+		t.Fatal("expected reverse forward terminate for port 8154")
 	}
 }
 
