@@ -3,6 +3,7 @@ package gcp
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -195,6 +196,13 @@ func TestSSHConfig(t *testing.T) {
 		"--zone", "us-central1-a",
 		"--format", "json(networkInterfaces[0].accessConfigs[0].natIP)",
 	)
+	f.Stub(
+		`ssh -i /tmp/google_compute_engine -o UserKnownHostsFile=/tmp/google_compute_known_hosts -o HostKeyAlias=compute.123 alice@1.2.3.4`,
+		"gcloud", "compute", "ssh", instanceName,
+		"--project", "my-project",
+		"--zone", "us-central1-a",
+		"--dry-run",
+	)
 	p := New(testConfig(), f)
 
 	sshCfg, err := p.SSHConfig(context.Background())
@@ -214,8 +222,78 @@ func TestSSHConfig(t *testing.T) {
 	if sshCfg.User == "" {
 		t.Error("User should not be empty")
 	}
+	if sshCfg.User != "alice" {
+		t.Errorf("User: got %q, want %q", sshCfg.User, "alice")
+	}
 	if !f.CalledWith("gcloud", "compute", "config-ssh", "--project", "my-project") {
 		t.Error("expected gcloud compute config-ssh to be called")
+	}
+}
+
+func TestSSHConfigPrefersOpenSSHKeyWhenDryRunUsesPuttyPPK(t *testing.T) {
+	oldTrustHost := trustHostFunc
+	t.Cleanup(func() {
+		trustHostFunc = oldTrustHost
+	})
+	trustHostFunc = func(client *sshrun.Client, knownHostsFile, hostKeyAlias string) error { return nil }
+
+	f := shell.NewFakeCommander()
+	instanceName := testConfig().InstanceName()
+	f.Stub(
+		`{"networkInterfaces":[{"accessConfigs":[{"natIP":"1.2.3.4"}]}]}`,
+		"gcloud", "compute", "instances", "describe", instanceName,
+		"--project", "my-project",
+		"--zone", "us-central1-a",
+		"--format", "json(networkInterfaces[0].accessConfigs[0].natIP)",
+	)
+	f.Stub(
+		`"C:\Program Files (x86)\Google\Cloud SDK\google-cloud-sdk\bin\sdk\putty.exe" -t -i "C:\Users\Rezavec\.ssh\google_compute_engine.ppk" Rezavec@1.2.3.4`,
+		"gcloud", "compute", "ssh", instanceName,
+		"--project", "my-project",
+		"--zone", "us-central1-a",
+		"--dry-run",
+	)
+
+	p := New(testConfig(), f)
+	sshCfg, err := p.SSHConfig(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if sshCfg.User != "Rezavec" {
+		t.Fatalf("User: got %q, want %q", sshCfg.User, "Rezavec")
+	}
+	if strings.HasSuffix(strings.ToLower(sshCfg.IdentityFile), ".ppk") {
+		t.Fatalf("IdentityFile should not use .ppk: %q", sshCfg.IdentityFile)
+	}
+}
+
+func TestParseSSHInvocationParsesUserAtHost(t *testing.T) {
+	info, err := parseSSHInvocation(`ssh -i "C:\Users\Rezavec\.ssh\google_compute_engine" -o UserKnownHostsFile="C:\Users\Rezavec\.ssh\google_compute_known_hosts" -o HostKeyAlias=compute.220242 rezavec_gcp@34.90.170.209`)
+	if err != nil {
+		t.Fatalf("parseSSHInvocation: %v", err)
+	}
+	if info.User != "rezavec_gcp" {
+		t.Fatalf("User: got %q, want %q", info.User, "rezavec_gcp")
+	}
+	if info.IdentityFile != `C:\Users\Rezavec\.ssh\google_compute_engine` {
+		t.Fatalf("IdentityFile: got %q", info.IdentityFile)
+	}
+	if info.KnownHostsFile != `C:\Users\Rezavec\.ssh\google_compute_known_hosts` {
+		t.Fatalf("KnownHostsFile: got %q", info.KnownHostsFile)
+	}
+	if info.HostKeyAlias != "compute.220242" {
+		t.Fatalf("HostKeyAlias: got %q", info.HostKeyAlias)
+	}
+}
+
+func TestParseSSHInvocationParsesDashLUser(t *testing.T) {
+	info, err := parseSSHInvocation(`ssh -l oslogin-user -i /tmp/google_compute_engine -o UserKnownHostsFile=/tmp/known_hosts 34.90.170.209`)
+	if err != nil {
+		t.Fatalf("parseSSHInvocation: %v", err)
+	}
+	if info.User != "oslogin-user" {
+		t.Fatalf("User: got %q, want %q", info.User, "oslogin-user")
 	}
 }
 

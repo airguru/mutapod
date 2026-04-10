@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/mutapod/mutapod/internal/config"
 	"github.com/mutapod/mutapod/internal/provider"
@@ -245,16 +246,29 @@ func (p *Provider) SSHConfig(ctx context.Context) (*provider.SSHConfig, error) {
 
 	host := fmt.Sprintf("%s.%s.%s", p.name, gcp.Zone, gcp.Project)
 
-	// gcloud compute config-ssh writes the correct IdentityFile into ~/.ssh/config
-	// but does NOT write a User line — it relies on the local OS username.
 	sshConfigPath := filepath.Join(home, ".ssh", "config")
 	entry := parseSSHConfigEntry(sshConfigPath, host)
-
-	sshUser := entry.User
-	if sshUser == "" {
-		sshUser = gcpSSHUsername() // local OS username, same as gcloud uses
+	invocation, err := p.resolveSSHInvocation(ctx)
+	if err != nil {
+		shell.Debugf("gcp: compute ssh --dry-run unavailable, falling back to ssh config heuristics: %v", err)
 	}
-	identityFile := entry.IdentityFile
+
+	sshUser := invocation.User
+	if sshUser == "" {
+		sshUser = entry.User
+	}
+	if sshUser == "" {
+		sshUser = gcpSSHUsername()
+	}
+	identityFile := invocation.IdentityFile
+	if strings.EqualFold(filepath.Ext(identityFile), ".ppk") {
+		// gcloud may use PuTTY on Windows, but our pure-Go SSH client needs the
+		// OpenSSH-formatted private key from ~/.ssh/config.
+		identityFile = ""
+	}
+	if identityFile == "" {
+		identityFile = entry.IdentityFile
+	}
 	if identityFile == "" {
 		identityFile = filepath.Join(home, ".ssh", "google_compute_engine")
 	}
@@ -275,14 +289,20 @@ func (p *Provider) SSHConfig(ctx context.Context) (*provider.SSHConfig, error) {
 
 	// Populate the known_hosts file that mutagen (and gcloud) uses, so host
 	// key verification succeeds without ever running an interactive SSH client.
-	knownHostsFile := entry.KnownHostsFile
+	knownHostsFile := invocation.KnownHostsFile
+	if knownHostsFile == "" {
+		knownHostsFile = entry.KnownHostsFile
+	}
 	if knownHostsFile == "" {
 		knownHostsFile = filepath.Join(home, ".ssh", "google_compute_known_hosts")
 	}
 	if strings.HasPrefix(knownHostsFile, "~/") {
 		knownHostsFile = filepath.Join(home, knownHostsFile[2:])
 	}
-	hostKeyAlias := entry.HostKeyAlias
+	hostKeyAlias := invocation.HostKeyAlias
+	if hostKeyAlias == "" {
+		hostKeyAlias = entry.HostKeyAlias
+	}
 	if hostKeyAlias == "" {
 		hostKeyAlias = ip
 	}
@@ -295,6 +315,33 @@ func (p *Provider) SSHConfig(ctx context.Context) (*provider.SSHConfig, error) {
 	shell.Debugf("gcp: host key trusted in %s for alias %s", knownHostsFile, hostKeyAlias)
 
 	return cfg, nil
+}
+
+type sshInvocation struct {
+	User           string
+	IdentityFile   string
+	KnownHostsFile string
+	HostKeyAlias   string
+}
+
+func (p *Provider) resolveSSHInvocation(ctx context.Context) (sshInvocation, error) {
+	out, err := p.cmd.Output(ctx, shell.RunOptions{}, "gcloud", "compute", "ssh",
+		p.name,
+		"--project", p.cfg.Provider.GCP.Project,
+		"--zone", p.cfg.Provider.GCP.Zone,
+		"--dry-run",
+	)
+	if err != nil {
+		return sshInvocation{}, fmt.Errorf("gcp: compute ssh --dry-run: %w", err)
+	}
+	info, err := parseSSHInvocation(string(out))
+	if err != nil {
+		return sshInvocation{}, fmt.Errorf("gcp: parse compute ssh --dry-run: %w", err)
+	}
+	if info.User == "" {
+		return sshInvocation{}, fmt.Errorf("gcp: compute ssh --dry-run did not include an SSH username")
+	}
+	return info, nil
 }
 
 // sshConfigEntry holds the fields we care about from a ~/.ssh/config Host block.
@@ -340,8 +387,124 @@ func parseSSHConfigEntry(configPath, hostname string) sshConfigEntry {
 	return e
 }
 
-// gcpSSHUsername returns the local OS username that gcloud uses for SSH keys.
-// On Windows, os/user.Current() may return "DOMAIN\user"; we strip the prefix.
+func parseSSHInvocation(raw string) (sshInvocation, error) {
+	tokens, err := splitCommandLine(strings.TrimSpace(raw))
+	if err != nil {
+		return sshInvocation{}, err
+	}
+	if len(tokens) == 0 {
+		return sshInvocation{}, fmt.Errorf("empty command line")
+	}
+
+	var info sshInvocation
+	for i := 1; i < len(tokens); i++ {
+		token := tokens[i]
+		switch token {
+		case "-i":
+			if i+1 >= len(tokens) {
+				return sshInvocation{}, fmt.Errorf("missing value after -i")
+			}
+			info.IdentityFile = tokens[i+1]
+			i++
+		case "-l":
+			if i+1 >= len(tokens) {
+				return sshInvocation{}, fmt.Errorf("missing value after -l")
+			}
+			info.User = tokens[i+1]
+			i++
+		case "-o":
+			if i+1 >= len(tokens) {
+				return sshInvocation{}, fmt.Errorf("missing value after -o")
+			}
+			consumed, err := applySSHOption(&info, tokens, i+1)
+			if err != nil {
+				return sshInvocation{}, err
+			}
+			i += consumed
+		default:
+			if strings.HasPrefix(token, "-o") && len(token) > 2 {
+				if err := applySSHOptionToken(&info, token[2:]); err != nil {
+					return sshInvocation{}, err
+				}
+				continue
+			}
+			if strings.HasPrefix(token, "-") {
+				continue
+			}
+			if info.User == "" && strings.Count(token, "@") == 1 {
+				parts := strings.SplitN(token, "@", 2)
+				info.User = parts[0]
+			}
+		}
+	}
+	return info, nil
+}
+
+func applySSHOption(info *sshInvocation, tokens []string, valueIndex int) (int, error) {
+	option := tokens[valueIndex]
+	if strings.Contains(option, "=") {
+		return 1, applySSHOptionToken(info, option)
+	}
+	if valueIndex+1 >= len(tokens) {
+		return 1, fmt.Errorf("missing value for ssh option %q", option)
+	}
+	return 2, applySSHOptionToken(info, option+"="+tokens[valueIndex+1])
+}
+
+func applySSHOptionToken(info *sshInvocation, option string) error {
+	parts := strings.SplitN(option, "=", 2)
+	if len(parts) != 2 {
+		return fmt.Errorf("invalid ssh option %q", option)
+	}
+	switch strings.ToLower(parts[0]) {
+	case "userknownhostsfile":
+		info.KnownHostsFile = parts[1]
+	case "hostkeyalias":
+		info.HostKeyAlias = parts[1]
+	case "identityfile":
+		info.IdentityFile = parts[1]
+	}
+	return nil
+}
+
+func splitCommandLine(s string) ([]string, error) {
+	var tokens []string
+	var current strings.Builder
+	var quote rune
+
+	flush := func() {
+		if current.Len() == 0 {
+			return
+		}
+		tokens = append(tokens, current.String())
+		current.Reset()
+	}
+
+	for _, r := range s {
+		switch {
+		case quote != 0:
+			if r == quote {
+				quote = 0
+				continue
+			}
+			current.WriteRune(r)
+		case r == '"' || r == '\'':
+			quote = r
+		case unicode.IsSpace(r):
+			flush()
+		default:
+			current.WriteRune(r)
+		}
+	}
+	if quote != 0 {
+		return nil, fmt.Errorf("unterminated quoted string")
+	}
+	flush()
+	return tokens, nil
+}
+
+// gcpSSHUsername is a fallback when gcloud does not expose the effective SSH
+// user via `gcloud compute ssh --dry-run`.
 func gcpSSHUsername() string {
 	u, err := user.Current()
 	if err != nil {
