@@ -1,20 +1,29 @@
 version: 2
 
 builds:
-  - main: ./cmd/mutapod
+  - id: unix
+    main: ./cmd/mutapod
     binary: mutapod
     env:
       - CGO_ENABLED=0
     goos:
       - linux
       - darwin
-      - windows
     goarch:
       - amd64
       - arm64
-    ignore:
-      - goos: windows
-        goarch: arm64
+    ldflags:
+      - -s -w
+
+  - id: windows
+    main: ./cmd/mutapod
+    binary: mutapod
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - windows
+    goarch:
+      - amd64
     ldflags:
       - -s -w
 
@@ -23,25 +32,19 @@ archives:
     formats:
       - tar.gz
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
-    builds:
-      - mutapod
-    filter:
-      exclude:
-        - "*.bat"
-    goos:
-      - linux
-      - darwin
+    ids:
+      - unix
 
   - id: windows
     formats:
       - zip
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
-    builds:
-      - mutapod
-    goos:
+    ids:
       - windows
-    extra_files:
-      - glob: scripts/install.bat
+    files:
+      - LICENSE*
+      - README*
+      - scripts/install.bat
 
 checksum:
   name_template: "checksums.txt"
