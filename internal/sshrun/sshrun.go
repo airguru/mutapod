@@ -82,6 +82,10 @@ func (c *Client) Run(ctx context.Context, cmd string, stdin io.Reader, stdout, s
 // under hostAlias. This lets external tools (e.g. mutagen) verify the host
 // without ever having connected via an interactive SSH client.
 // If the alias is already present in the file it does nothing.
+//
+// The SSH host key is exchanged before user authentication. On a fresh GCP VM
+// the daemon may already be reachable while the injected SSH key is still
+// propagating, so we treat "captured host key, auth failed" as success.
 func (c *Client) TrustHost(knownHostsFile, hostAlias string) error {
 	// Check if already present.
 	if data, err := os.ReadFile(knownHostsFile); err == nil {
@@ -111,11 +115,26 @@ func (c *Client) TrustHost(knownHostsFile, hostAlias string) error {
 		},
 		Timeout: 30 * time.Second,
 	}
-	conn, err := gossh.Dial("tcp", fmt.Sprintf("%s:%d", c.ip, c.port), cfg)
+	addr := fmt.Sprintf("%s:%d", c.ip, c.port)
+	conn, err := net.DialTimeout("tcp", addr, cfg.Timeout)
 	if err != nil {
 		return fmt.Errorf("sshrun: connect to capture host key: %w", err)
 	}
-	conn.Close()
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(cfg.Timeout)); err != nil {
+		return fmt.Errorf("sshrun: set deadline while capturing host key: %w", err)
+	}
+	sshConn, _, _, err := gossh.NewClientConn(conn, addr, cfg)
+	if err != nil {
+		if captured == nil {
+			return fmt.Errorf("sshrun: connect to capture host key: %w", err)
+		}
+	} else {
+		_ = sshConn.Close()
+	}
+	if captured == nil {
+		return fmt.Errorf("sshrun: connect to capture host key: host key was not received")
+	}
 
 	if err := os.MkdirAll(filepath.Dir(knownHostsFile), 0700); err != nil {
 		return fmt.Errorf("sshrun: create known_hosts dir: %w", err)
