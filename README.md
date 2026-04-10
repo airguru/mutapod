@@ -22,6 +22,9 @@ GCP is the only supported provider today.
 - `mutapod down`: run `docker compose down`, pause sync and forwards, release this workspace lease, and stop the VM immediately only when idle shutdown is disabled
 - `mutapod destroy`: destroy the VM after an explicit confirmation prompt, warn if other workspace leases are visible on the VM, and clean up local mutapod state
 - `mutapod status`: show the current workspace, provider, VM, and sync state
+- `mutapod version`: show the installed mutapod version and build metadata
+- `mutapod update --check`: check GitHub Releases and report whether a newer mutapod release is available
+- `mutapod update`: download the latest GitHub release for your platform, verify its checksum, and replace the local mutapod binary
 - `mutapod ssh`: open an interactive shell on the remote VM
 - `mutapod leases`: show the VM-side mutapod lease records, including last heartbeat and expiry
 
@@ -35,6 +38,7 @@ GCP is the only supported provider today.
 6. If you need a fresh image rebuild, use `mutapod up --build`.
 
 Mutagen is downloaded automatically into `~/.mutapod/bin` if it is not already available on `PATH`.
+mutapod itself can be updated explicitly with `mutapod update`.
 
 ## Example `mutapod.yaml`
 

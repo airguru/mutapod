@@ -5,6 +5,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/mutapod/mutapod/internal/buildinfo"
 	"github.com/mutapod/mutapod/internal/shell"
 )
 
@@ -21,6 +22,7 @@ func Root() *cobra.Command {
 		Long: `mutapod provisions a cloud VM on GCP, syncs your local project
 to it via Mutagen, starts a devcontainer, and forwards ports — all with one command.`,
 		SilenceUsage: true,
+		Version:      buildinfo.DisplayVersion(),
 		PersistentPreRun: func(cmd *cobra.Command, args []string) {
 			shell.SetDebug(debug)
 		},
@@ -37,6 +39,8 @@ to it via Mutagen, starts a devcontainer, and forwards ports — all with one co
 	root.AddCommand(sshCmd())
 	root.AddCommand(leasesCmd())
 	root.AddCommand(idleHeartbeatCmd())
+	root.AddCommand(versionCmd())
+	root.AddCommand(updateCmd())
 
 	return root
 }

@@ -13,7 +13,7 @@ builds:
       - amd64
       - arm64
     ldflags:
-      - -s -w
+      - -s -w -X github.com/mutapod/mutapod/internal/buildinfo.Version={{ .Version }} -X github.com/mutapod/mutapod/internal/buildinfo.Commit={{ .Commit }} -X github.com/mutapod/mutapod/internal/buildinfo.Date={{ .Date }}
 
   - id: windows
     main: ./cmd/mutapod
@@ -25,7 +25,7 @@ builds:
     goarch:
       - amd64
     ldflags:
-      - -s -w
+      - -s -w -X github.com/mutapod/mutapod/internal/buildinfo.Version={{ .Version }} -X github.com/mutapod/mutapod/internal/buildinfo.Commit={{ .Commit }} -X github.com/mutapod/mutapod/internal/buildinfo.Date={{ .Date }}
 
 archives:
   - id: unix
@@ -44,7 +44,8 @@ archives:
     files:
       - LICENSE*
       - README*
-      - scripts/install.bat
+      - src: scripts/install.bat
+        dst: install.bat
 
 checksum:
   name_template: "checksums.txt"
