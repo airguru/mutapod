@@ -56,6 +56,21 @@ func (c *Client) Run(ctx context.Context, cmd string, stdin io.Reader, stdout, s
 	}
 	defer conn.Close()
 
+	keepaliveDone := make(chan struct{})
+	defer close(keepaliveDone)
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-keepaliveDone:
+				return
+			case <-ticker.C:
+				_, _, _ = conn.SendRequest("keepalive@openssh.com", true, nil)
+			}
+		}
+	}()
+
 	session, err := conn.NewSession()
 	if err != nil {
 		return fmt.Errorf("sshrun: new session: %w", err)

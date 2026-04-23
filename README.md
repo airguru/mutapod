@@ -259,8 +259,8 @@ If a `.mutapodignore` file exists in the project root, mutapod converts it into 
 Important details:
 
 - `.gitignore` is not used as a Mutagen sync rule source.
-- `--ignore-vcs` only ignores VCS directories such as `.git`; it does not import `.gitignore` file patterns.
-- mutapod now creates sync sessions with Mutagen `--no-global-configuration` so your per-user `~/.mutagen.yml` cannot silently override project sync behavior.
+- VCS directories such as `.git` are synced by default, so the remote container and any agents running there can see the current branch and history. Add entries to `.mutapodignore` if you want to exclude specific subpaths (e.g. `.git/objects/pack`).
+- mutapod creates sync sessions with Mutagen `--no-global-configuration` so your per-user `~/.mutagen.yml` cannot silently override project sync behavior.
 
 ## Notes
 

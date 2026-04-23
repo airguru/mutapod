@@ -106,7 +106,6 @@ func (m *Manager) createSync(ctx context.Context) error {
 		"--label", "mutapod-name=" + m.cfg.Name,
 		"--no-global-configuration",
 		"--sync-mode", m.cfg.Sync.Mode,
-		"--ignore-vcs",
 	}
 	args = append(args, patterns.MutagenFlags()...)
 	args = append(args, localPath, remote)
@@ -130,9 +129,8 @@ func (m *Manager) SessionConfigSignature(ctx context.Context) (string, error) {
 	}
 	remote := fmt.Sprintf("%s@%s:%s", m.sshCfg.User, m.sshCfg.Host, m.cfg.WorkspacePath())
 	parts := []string{
-		"v2",
+		"v3",
 		"no-global-configuration=true",
-		"ignore-vcs=true",
 		"sync-mode=" + m.cfg.Sync.Mode,
 		"local=" + localPath,
 		"remote=" + remote,

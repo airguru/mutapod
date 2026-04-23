@@ -504,6 +504,17 @@ func upCommand(workspacePath, composeArgs string, build bool) string {
 	)
 }
 
+// ConfigureGitSafeDirectory marks every path as safe for git inside the
+// primary service container, so VS Code and CLI tools can use git even when
+// the workspace files are owned by a different UID than the container user.
+func ConfigureGitSafeDirectory(ctx context.Context, p provider.Provider, cfg *config.Config, activeProfiles []profiles.Spec) error {
+	if cfg.Compose.PrimaryService == "" {
+		return nil
+	}
+	script := "command -v git >/dev/null 2>&1 && git config --system --add safe.directory '*' || true"
+	return ExecInPrimaryService(ctx, p, cfg, activeProfiles, script)
+}
+
 // ExecInPrimaryService runs a shell script inside the primary service
 // container. It uses `docker compose exec -T --user root` so mutapod can
 // install helper tooling predictably.

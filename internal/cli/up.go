@@ -355,6 +355,14 @@ func runUpWithConfig(ctx context.Context, cfg *config.Config, launchMode vscode.
 			return err
 		}
 		ok("Workspace sync permissions protected")
+
+		step("Configuring git safe directory in the main container...")
+		if err := compose.ConfigureGitSafeDirectory(ctx, prov, cfg, activeProfiles); err != nil {
+			shell.Debugf("git safe.directory: %v", err)
+			fmt.Fprintf(os.Stderr, "  warning: could not configure git safe.directory in container: %v\n", err)
+		} else {
+			ok("Git safe directory configured")
+		}
 	}
 
 	if len(activeProfiles) > 0 && cfg.Compose.PrimaryService != "" {

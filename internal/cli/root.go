@@ -25,6 +25,7 @@ to it via Mutagen, starts a devcontainer, and forwards ports — all with one co
 		Version:      buildinfo.DisplayVersion(),
 		PersistentPreRun: func(cmd *cobra.Command, args []string) {
 			shell.SetDebug(debug)
+			maybeCheckForUpdate(cmd)
 		},
 	}
 

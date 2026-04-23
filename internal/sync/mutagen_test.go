@@ -112,7 +112,6 @@ func TestCreateSync_DisablesGlobalMutagenConfiguration(t *testing.T) {
 		"--label", "mutapod-name=myapp",
 		"--no-global-configuration",
 		"--sync-mode", "two-way-resolved",
-		"--ignore-vcs",
 		"--ignore", "mutapod.code-workspace",
 		localDir,
 		"alice@example-host:/workspace/myapp",
