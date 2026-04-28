@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/mutapod/mutapod/internal/config"
 )
@@ -15,6 +16,7 @@ import (
 var (
 	userHomeDir = os.UserHomeDir
 	lookPath    = exec.LookPath
+	retryDelay  = 3 * time.Second
 )
 
 const RootHomeDir = "/root"
@@ -376,6 +378,23 @@ func nodeProfileSetupScript(setup nodeProfileSetup) string {
 		fmt.Sprintf("tool_prefix=%s", shString(setup.ToolPrefix)),
 		fmt.Sprintf("binary_name=%s", shString(setup.BinaryName)),
 		fmt.Sprintf("package_name=%s", shString(setup.PackageName)),
+		"start_mutapod_profile_heartbeat() {",
+		"  (",
+		"    while :; do",
+		"      sleep 15",
+		"      echo \"mutapod: profile setup still running for $package_name\" >&2",
+		"    done",
+		"  ) &",
+		"  mutapod_profile_heartbeat_pid=$!",
+		"}",
+		"stop_mutapod_profile_heartbeat() {",
+		"  if [ -n \"${mutapod_profile_heartbeat_pid:-}\" ]; then",
+		"    kill \"$mutapod_profile_heartbeat_pid\" 2>/dev/null || true",
+		"    wait \"$mutapod_profile_heartbeat_pid\" 2>/dev/null || true",
+		"  fi",
+		"}",
+		"start_mutapod_profile_heartbeat",
+		"trap stop_mutapod_profile_heartbeat EXIT INT TERM",
 		"install_node_runtime() {",
 		"  if command -v npm >/dev/null 2>&1; then",
 		"    return 0",
@@ -403,6 +422,7 @@ func nodeProfileSetupScript(setup nodeProfileSetup) string {
 		"install_node_runtime",
 		"mkdir -p \"$tool_prefix\"",
 		"if [ ! -x \"$tool_prefix/bin/$binary_name\" ]; then",
+		"  echo \"mutapod: installing $package_name in $tool_prefix\" >&2",
 		"  npm install -g --prefix \"$tool_prefix\" \"$package_name\" >/dev/null",
 		"fi",
 	}
@@ -566,8 +586,28 @@ func EnsureRemoteTools(ctx context.Context, runner interface {
 }, cfg *config.Config, active []Spec) error {
 	for _, spec := range active {
 		if err := runner.RunProfileSetup(ctx, cfg, active, spec); err != nil {
+			if isMissingRemoteExitStatus(err) {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(retryDelay):
+				}
+				if retryErr := runner.RunProfileSetup(ctx, cfg, active, spec); retryErr == nil {
+					continue
+				} else {
+					return fmt.Errorf("profiles: %s remote setup retry after lost SSH session: %w (original error: %v)", spec.Name, retryErr, err)
+				}
+			}
 			return fmt.Errorf("profiles: %s remote setup: %w", spec.Name, err)
 		}
 	}
 	return nil
+}
+
+func isMissingRemoteExitStatus(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "without exit status or exit signal")
 }

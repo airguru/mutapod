@@ -1,11 +1,14 @@
 package profiles
 
 import (
+	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mutapod/mutapod/internal/config"
 )
@@ -186,4 +189,58 @@ func TestCodexProfileFallsBackToVSCodeExtensionBinary(t *testing.T) {
 	if !strings.HasSuffix(strings.ToLower(codex.LocalBinaryPath), filepath.Join("bin", "windows-x86_64", "codex.exe")) {
 		t.Fatalf("LocalBinaryPath: got %q", codex.LocalBinaryPath)
 	}
+}
+
+func TestNodeProfileSetupScriptEmitsHeartbeatWhileInstalling(t *testing.T) {
+	script := nodeProfileSetupScript(nodeProfileSetup{
+		PackageName: "@example/tool",
+		ToolPrefix:  "/var/lib/mutapod/tools/example",
+		BinaryName:  "example",
+		WrapperName: "example",
+		WrapperBody: "exec /var/lib/mutapod/tools/example/bin/example \"$@\"",
+	})
+
+	for _, expected := range []string{
+		"start_mutapod_profile_heartbeat",
+		"profile setup still running for $package_name",
+		"trap stop_mutapod_profile_heartbeat EXIT INT TERM",
+		"mutapod: installing $package_name in $tool_prefix",
+	} {
+		if !strings.Contains(script, expected) {
+			t.Fatalf("SetupScript missing %q:\n%s", expected, script)
+		}
+	}
+}
+
+func TestEnsureRemoteToolsRetriesMissingRemoteExitStatus(t *testing.T) {
+	oldRetryDelay := retryDelay
+	t.Cleanup(func() { retryDelay = oldRetryDelay })
+	retryDelay = time.Nanosecond
+
+	runner := &profileSetupRunner{
+		errs: []error{
+			errors.New("wait: remote command exited without exit status or exit signal"),
+			nil,
+		},
+	}
+	cfg := &config.Config{Name: "demo"}
+	active := []Spec{{Name: "codex"}}
+
+	if err := EnsureRemoteTools(context.Background(), runner, cfg, active); err != nil {
+		t.Fatalf("EnsureRemoteTools: %v", err)
+	}
+	if runner.calls != 2 {
+		t.Fatalf("RunProfileSetup calls: got %d, want 2", runner.calls)
+	}
+}
+
+type profileSetupRunner struct {
+	calls int
+	errs  []error
+}
+
+func (r *profileSetupRunner) RunProfileSetup(context.Context, *config.Config, []Spec, Spec) error {
+	err := r.errs[r.calls]
+	r.calls++
+	return err
 }
