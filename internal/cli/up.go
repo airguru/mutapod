@@ -757,11 +757,17 @@ func buildWorkspaceACLScript(workspaceFolder string) string {
 	return fmt.Sprintf(`set -eu
 workspace=%s
 uid=$(stat -c %%u "$workspace")
+repair_debian_packages() {
+  if command -v dpkg >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive dpkg --configure -a >/dev/null
+  fi
+}
 ensure_acl_tools() {
   if command -v setfacl >/dev/null 2>&1; then
     return 0
   fi
   if command -v apt-get >/dev/null 2>&1; then
+    repair_debian_packages
     apt-get update -qq >/dev/null
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq acl >/dev/null
     return 0
