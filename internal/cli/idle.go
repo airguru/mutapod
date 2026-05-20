@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -94,22 +95,78 @@ func runIdleHeartbeat(_ *cobra.Command, _ []string) error {
 	}
 }
 
-func maybeConfigureIdle(ctx context.Context, cfg *config.Config, prov provider.Provider, sshCfg *provider.SSHConfig) error {
-	step("Configuring lease tracking...")
-	if err := idle.InstallRemote(ctx, prov); err != nil {
-		return err
-	}
+type idleLeaseRefresher struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+	once   sync.Once
+}
 
+func (r *idleLeaseRefresher) Stop() {
+	if r == nil {
+		return
+	}
+	r.once.Do(func() {
+		r.cancel()
+		<-r.done
+	})
+}
+
+func maybeConfigureIdleLease(ctx context.Context, cfg *config.Config, prov provider.Provider, sshCfg *provider.SSHConfig) (*idleLeaseRefresher, error) {
+	step("Configuring lease tracking...")
 	sshClient := sshrun.New(sshCfg.IP, sshCfg.Port, sshCfg.User, sshCfg.IdentityFile)
 	hostID, _ := os.Hostname()
+
 	if err := idle.WriteLeaseWithRetry(ctx, sshClient, cfg.Name, hostID, idle.LeaseExpiry(cfg, time.Now())); err != nil {
-		return fmt.Errorf("idle: write initial lease: %w", err)
+		shell.Debugf("idle: early lease refresh before install: %v", err)
+	}
+	if err := idle.InstallRemote(ctx, prov); err != nil {
+		return nil, err
+	}
+
+	if err := idle.WriteLeaseWithRetry(ctx, sshClient, cfg.Name, hostID, idle.LeaseExpiry(cfg, time.Now())); err != nil {
+		return nil, fmt.Errorf("idle: write initial lease: %w", err)
 	}
 	if cfg.Idle.IsEnabled() {
 		if err := idle.EnableTimer(ctx, prov); err != nil {
-			return fmt.Errorf("idle: enable timer: %w", err)
+			return nil, fmt.Errorf("idle: enable timer: %w", err)
 		}
 	}
+	refresher := startInProcessIdleLeaseRefresher(ctx, cfg, sshClient, hostID)
+	if cfg.Idle.IsEnabled() {
+		ok("Idle shutdown lease active")
+	} else {
+		ok("Lease tracking active")
+	}
+	return refresher, nil
+}
+
+func startInProcessIdleLeaseRefresher(parent context.Context, cfg *config.Config, client *sshrun.Client, hostID string) *idleLeaseRefresher {
+	ctx, cancel := context.WithCancel(parent)
+	refresher := &idleLeaseRefresher{
+		cancel: cancel,
+		done:   make(chan struct{}),
+	}
+	go func() {
+		defer close(refresher.done)
+		interval := idle.HeartbeatInterval(cfg)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(interval):
+			}
+
+			expiresAt := idle.LeaseExpiry(cfg, time.Now())
+			if err := idle.WriteLeaseWithClient(ctx, client, cfg.Name, hostID, expiresAt); err != nil {
+				shell.Debugf("idle: in-process lease refresh: %v", err)
+			}
+		}
+	}()
+	return refresher
+}
+
+func maybeStartIdleHeartbeat(cfg *config.Config) error {
+	step("Starting lease heartbeat...")
 	if err := startIdleHeartbeat(cfg); err != nil {
 		return fmt.Errorf("idle: start heartbeat: %w", err)
 	}

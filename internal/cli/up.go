@@ -102,6 +102,16 @@ func runUpWithConfig(ctx context.Context, cfg *config.Config, launchMode vscode.
 	}
 	ok("SSH host: %s", sshCfg.Host)
 
+	idleRefresher, err := maybeConfigureIdleLease(ctx, cfg, prov, sshCfg)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if idleRefresher != nil {
+			idleRefresher.Stop()
+		}
+	}()
+
 	ipChanged := st.Instance.LastKnownIP != "" && st.Instance.LastKnownIP != sshCfg.IP
 
 	activeProfiles, err := profiles.Active(cfg)
@@ -441,9 +451,11 @@ func runUpWithConfig(ctx context.Context, cfg *config.Config, launchMode vscode.
 		ok("Attached-container defaults configured: %s", attachedConfigPath)
 	}
 
-	if err := maybeConfigureIdle(ctx, cfg, prov, sshCfg); err != nil {
+	if err := maybeStartIdleHeartbeat(cfg); err != nil {
 		return err
 	}
+	idleRefresher.Stop()
+	idleRefresher = nil
 
 	vscode.PrintInstructions(cfg, sshCfg, ports)
 	step("Opening VS Code (%s)...", launchMode)
@@ -758,6 +770,12 @@ func buildWorkspaceACLScript(workspaceFolder string) string {
 workspace=%s
 uid=$(stat -c %%u "$workspace")
 repair_debian_packages() {
+  if command -v dpkg >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive dpkg --configure -a >/dev/null || true
+  fi
+  if command -v apt-get >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -f -y -qq >/dev/null
+  fi
   if command -v dpkg >/dev/null 2>&1; then
     DEBIAN_FRONTEND=noninteractive dpkg --configure -a >/dev/null
   fi

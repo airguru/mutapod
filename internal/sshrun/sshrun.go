@@ -12,8 +12,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mutapod/mutapod/internal/shell"
 	gossh "golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
+)
+
+var (
+	dialRetryTimeout  = 90 * time.Second
+	dialRetryInterval = 2 * time.Second
 )
 
 // Client is a lightweight SSH client.
@@ -50,7 +56,7 @@ func (c *Client) dial() (*gossh.Client, error) {
 
 // Run executes a shell command on the remote host.
 func (c *Client) Run(ctx context.Context, cmd string, stdin io.Reader, stdout, stderr io.Writer) error {
-	conn, err := c.dial()
+	conn, err := c.dialWithRetry(ctx)
 	if err != nil {
 		return err
 	}
@@ -91,6 +97,45 @@ func (c *Client) Run(ctx context.Context, cmd string, stdin io.Reader, stdout, s
 	case err := <-done:
 		return err
 	}
+}
+
+func (c *Client) dialWithRetry(ctx context.Context) (*gossh.Client, error) {
+	deadline := time.Now().Add(dialRetryTimeout)
+	for {
+		conn, err := c.dial()
+		if err == nil {
+			return conn, nil
+		}
+		if !isTransientDialError(err) || time.Now().After(deadline) {
+			return nil, err
+		}
+
+		shell.Debugf("sshrun: SSH dial failed, retrying: %v", err)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(dialRetryInterval):
+		}
+	}
+}
+
+func isTransientDialError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "connection attempt failed") ||
+		strings.Contains(msg, "failed to respond") ||
+		strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "actively refused") ||
+		strings.Contains(msg, "connection reset by peer") ||
+		strings.Contains(msg, "no route to host") ||
+		strings.Contains(msg, "network is unreachable") ||
+		strings.Contains(msg, "i/o timeout") ||
+		strings.Contains(msg, "operation timed out") ||
+		strings.Contains(msg, "permission denied (publickey)") ||
+		strings.Contains(msg, "unable to authenticate") ||
+		strings.Contains(msg, "eof")
 }
 
 // TrustHost scans the remote server's host key and appends it to knownHostsFile
@@ -172,7 +217,12 @@ func (c *Client) Upload(ctx context.Context, localPath, remotePath string) error
 	}
 	defer f.Close()
 
-	// Escape single quotes in the remote path.
-	safe := strings.ReplaceAll(remotePath, "'", "'\\''")
-	return c.Run(ctx, "cat > '"+safe+"'", f, io.Discard, io.Discard)
+	return c.Run(ctx, "cat > "+shellQuote(remotePath), f, io.Discard, io.Discard)
+}
+
+func shellQuote(s string) string {
+	if s == "" {
+		return "''"
+	}
+	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 }

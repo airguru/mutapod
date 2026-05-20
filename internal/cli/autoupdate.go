@@ -12,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/mutapod/mutapod/internal/buildinfo"
+	"github.com/mutapod/mutapod/internal/shell"
 	"github.com/mutapod/mutapod/internal/update"
 )
 
@@ -31,29 +32,43 @@ var skippedAutoUpdateCommands = map[string]bool{
 
 func maybeCheckForUpdate(cmd *cobra.Command) {
 	if cmd == nil || skippedAutoUpdateCommands[cmd.Name()] {
+		if cmd != nil {
+			shell.Debugf("update: skipping automatic check for command %q", cmd.Name())
+		}
 		return
 	}
 	if !isReleaseBuild() {
+		shell.Debugf("update: skipping automatic check for non-release build %q", buildinfo.DisplayVersion())
 		return
 	}
 	if os.Getenv("MUTAPOD_SKIP_UPDATE_CHECK") == "1" {
+		shell.Debugf("update: skipping automatic check because MUTAPOD_SKIP_UPDATE_CHECK=1")
 		return
 	}
 	if !isTerminal(os.Stdin) || !isTerminal(os.Stdout) {
+		shell.Debugf("update: skipping automatic check because stdin/stdout is not an interactive terminal")
 		return
 	}
 
 	updater, err := update.New()
 	if err != nil {
+		shell.Debugf("update: skipping automatic check: %v", err)
 		return
 	}
 
+	shell.Debugf("update: checking GitHub releases for updates from %s", buildinfo.DisplayVersion())
 	checkCtx, cancelCheck := context.WithTimeout(context.Background(), autoUpdateCheckTimeout)
 	defer cancelCheck()
 	status, err := updater.Check(checkCtx, buildinfo.DisplayVersion())
-	if err != nil || status.UpToDate {
+	if err != nil {
+		shell.Debugf("update: automatic check failed: %v", err)
 		return
 	}
+	if status.UpToDate {
+		shell.Debugf("update: current version %s is up to date (latest: %s)", buildinfo.DisplayVersion(), status.Latest.TagName)
+		return
+	}
+	shell.Debugf("update: newer version available: %s", status.Latest.TagName)
 
 	current := displayCurrentVersion(status)
 	fmt.Printf("A new mutapod version is available: %s (current: %s)\n", status.Latest.TagName, current)

@@ -204,7 +204,8 @@ func TestNodeProfileSetupScriptEmitsHeartbeatWhileInstalling(t *testing.T) {
 		"start_mutapod_profile_heartbeat",
 		"profile setup still running for $package_name",
 		"trap stop_mutapod_profile_heartbeat EXIT INT TERM",
-		"DEBIAN_FRONTEND=noninteractive dpkg --configure -a >/dev/null",
+		"DEBIAN_FRONTEND=noninteractive dpkg --configure -a >/dev/null || true",
+		"DEBIAN_FRONTEND=noninteractive apt-get install -f -y -qq >/dev/null",
 		"repair_debian_packages",
 		"mutapod: installing $package_name in $tool_prefix",
 	} {

@@ -11,7 +11,8 @@ func TestBuildWorkspaceACLScript(t *testing.T) {
 	for _, needle := range []string{
 		"workspace='/app'",
 		"uid=$(stat -c %u \"$workspace\")",
-		"DEBIAN_FRONTEND=noninteractive dpkg --configure -a >/dev/null",
+		"DEBIAN_FRONTEND=noninteractive dpkg --configure -a >/dev/null || true",
+		"DEBIAN_FRONTEND=noninteractive apt-get install -f -y -qq >/dev/null",
 		"if command -v apt-get >/dev/null 2>&1; then",
 		"repair_debian_packages",
 		"apt-get install -y -qq acl >/dev/null",
