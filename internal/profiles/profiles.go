@@ -256,9 +256,17 @@ func newCodexDefinition() Definition {
 			"logs_*.sqlite",
 			"logs_*.sqlite-shm",
 			"logs_*.sqlite-wal",
+			"memories_*.sqlite",
+			"memories_*.sqlite-shm",
+			"memories_*.sqlite-wal",
 			"state_*.sqlite",
 			"state_*.sqlite-shm",
 			"state_*.sqlite-wal",
+		},
+		settingsBuilder: func(spec Spec) map[string]any {
+			return map[string]any{
+				"extensions.supportNodeGlobalNavigator": true,
+			}
 		},
 		setupScriptBuilder: func(spec Spec, pkg string) string {
 			configMount := spec.Mounts[0].ContainerPath

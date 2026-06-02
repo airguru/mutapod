@@ -155,6 +155,9 @@ services:
 	if _, ok := got.Settings["chatgpt.cliExecutable"]; ok {
 		t.Fatalf("chatgpt.cliExecutable should not be set, got %#v", got.Settings["chatgpt.cliExecutable"])
 	}
+	if got.Settings["extensions.supportNodeGlobalNavigator"] != true {
+		t.Fatalf("extensions.supportNodeGlobalNavigator: got %#v", got.Settings["extensions.supportNodeGlobalNavigator"])
+	}
 	if got.Settings["claudeCode.claudeProcessWrapper"] != "/usr/local/bin/claude" {
 		t.Fatalf("claudeCode.claudeProcessWrapper: got %#v", got.Settings["claudeCode.claudeProcessWrapper"])
 	}

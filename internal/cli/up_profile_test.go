@@ -42,6 +42,7 @@ func TestCodexRuntimeSQLiteCleanupCommandMovesDatabasesOutsideProfile(t *testing
 		"backup_root=/var/lib/mutapod/profile-backups/codex-runtime-sqlite",
 		"logs_*.sqlite",
 		"goals_*.sqlite",
+		"memories_*.sqlite",
 		"state_*.sqlite",
 		"sudo mv \"$f\" \"$backup\"/",
 	} {

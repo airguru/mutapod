@@ -253,9 +253,7 @@ func runUpWithConfig(ctx context.Context, cfg *config.Config, launchMode vscode.
 				IgnorePatterns: spec.IgnorePatterns,
 			}, sshCfg, mutagenPath, shell.DefaultCommander)
 			signature := session.ConfigSignature()
-			refreshed := false
 			if prior, ok := existingProfileState[spec.Name]; shouldRefreshProfileSession(prior, ok, signature) {
-				refreshed = true
 				if ok {
 					shell.Debugf("profile %s sync settings changed, recreating Mutagen session", spec.Name)
 				} else {
@@ -278,7 +276,7 @@ func runUpWithConfig(ctx context.Context, cfg *config.Config, launchMode vscode.
 			if err := session.VerifyReady(ctx); err != nil {
 				return err
 			}
-			if spec.Name == "codex" && refreshed {
+			if spec.Name == "codex" {
 				if err := cleanupRemoteCodexRuntimeSQLite(ctx, prov, spec.SyncRemotePath); err != nil {
 					return fmt.Errorf("profile codex runtime SQLite cleanup: %w", err)
 				}
@@ -764,6 +762,9 @@ func codexRuntimeSQLiteCleanupCommand(remotePath string) string {
 		"logs_*.sqlite",
 		"logs_*.sqlite-shm",
 		"logs_*.sqlite-wal",
+		"memories_*.sqlite",
+		"memories_*.sqlite-shm",
+		"memories_*.sqlite-wal",
 		"state_*.sqlite",
 		"state_*.sqlite-shm",
 		"state_*.sqlite-wal",
