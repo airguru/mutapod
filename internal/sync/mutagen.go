@@ -18,6 +18,12 @@ import (
 	"github.com/mutapod/mutapod/internal/shell"
 )
 
+const (
+	syncSessionConfigVersion   = "v4"
+	remoteDefaultFileMode      = "0666"
+	remoteDefaultDirectoryMode = "0777"
+)
+
 // Manager handles Mutagen sync and forward sessions for a workspace.
 type Manager struct {
 	cfg               *config.Config
@@ -126,6 +132,8 @@ func (m *Manager) createSync(ctx context.Context) error {
 		"--label", "mutapod-name=" + m.cfg.Name,
 		"--no-global-configuration",
 		"--sync-mode", m.cfg.Sync.Mode,
+		"--default-file-mode-beta", remoteDefaultFileMode,
+		"--default-directory-mode-beta", remoteDefaultDirectoryMode,
 	}
 	args = append(args, patterns.MutagenFlags()...)
 	args = append(args, localPath, remote)
@@ -139,25 +147,34 @@ func (m *Manager) createSync(ctx context.Context) error {
 // SessionConfigSignature returns a stable digest of the effective mutagen sync
 // session settings that require recreation when changed.
 func (m *Manager) SessionConfigSignature(ctx context.Context) (string, error) {
-	localPath, err := m.cfg.LocalSyncPath()
+	parts, err := m.sessionConfigSignatureParts(ctx)
 	if err != nil {
 		return "", err
 	}
+	sum := sha256.Sum256([]byte(strings.Join(parts, "\n")))
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func (m *Manager) sessionConfigSignatureParts(ctx context.Context) ([]string, error) {
+	localPath, err := m.cfg.LocalSyncPath()
+	if err != nil {
+		return nil, err
+	}
 	patterns, err := ignore.Load(m.cfg.Dir)
 	if err != nil {
-		return "", fmt.Errorf("sync: load ignore patterns: %w", err)
+		return nil, fmt.Errorf("sync: load ignore patterns: %w", err)
 	}
 	remote := fmt.Sprintf("%s@%s:%s", m.sshCfg.User, m.sshCfg.Host, m.cfg.WorkspacePath())
-	parts := []string{
-		"v3",
+	return []string{
+		syncSessionConfigVersion,
 		"no-global-configuration=true",
 		"sync-mode=" + m.cfg.Sync.Mode,
+		"default-file-mode-beta=" + remoteDefaultFileMode,
+		"default-directory-mode-beta=" + remoteDefaultDirectoryMode,
 		"local=" + localPath,
 		"remote=" + remote,
 		"ignore-signature=" + patterns.Signature(),
-	}
-	sum := sha256.Sum256([]byte(strings.Join(parts, "\n")))
-	return hex.EncodeToString(sum[:]), nil
+	}, nil
 }
 
 func (m *Manager) resumeSync(ctx context.Context) error {

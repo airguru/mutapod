@@ -259,6 +259,14 @@ For the common case, you can omit `sync` entirely. The defaults already mean:
 - place it at `/workspace/<name>` on the VM
 - use Mutagen `two-way-resolved` mode
 
+Mutapod configures Mutagen's VM endpoint to create regular files with mode
+`0666` and directories with mode `0777`. It also applies an inheritable
+open-access policy to the remote workspace before synchronization starts.
+This lets the VM user and arbitrary users inside the primary container edit the
+same bind-mounted tree without a background permission-repair loop. Mutagen
+continues to propagate executable status separately, so ordinary source files
+are not made executable.
+
 ### `compose`
 
 | Key | Required | Default | Notes |

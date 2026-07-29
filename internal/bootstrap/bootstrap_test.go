@@ -3,9 +3,23 @@ package bootstrap
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestBootstrapInstallsACLTools(t *testing.T) {
+	script := string(bootstrapScript)
+	for _, expected := range []string{
+		"command -v setfacl",
+		"apt-get update -qq",
+		"apt-get install -y --no-install-recommends acl",
+	} {
+		if !strings.Contains(script, expected) {
+			t.Fatalf("bootstrap script missing %q", expected)
+		}
+	}
+}
 
 func TestIsSSHStartupError(t *testing.T) {
 	tests := []struct {

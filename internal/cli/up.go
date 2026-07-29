@@ -408,11 +408,11 @@ func runUpWithConfig(ctx context.Context, cfg *config.Config, launchMode vscode.
 	ok("Services running")
 
 	if cfg.Compose.PrimaryService != "" {
-		step("Protecting workspace sync permissions...")
-		if err := ensureAttachedContainerWorkspaceACLs(ctx, prov, cfg, activeProfiles); err != nil {
+		step("Finalizing workspace permissions...")
+		if err := cleanupLegacyWorkspaceACLWatcher(ctx, prov, cfg, activeProfiles); err != nil {
 			return err
 		}
-		ok("Workspace sync permissions protected")
+		ok("Workspace permissions ready")
 
 		step("Configuring git safe directory in the main container...")
 		if err := compose.ConfigureGitSafeDirectory(ctx, prov, cfg, activeProfiles); err != nil {
@@ -883,14 +883,24 @@ func activeForwardBackend(cfg *config.Config, st *state.State) string {
 }
 
 func ensureRemoteWorkspace(ctx context.Context, prov provider.Provider, workspacePath, user string) error {
-	cmd := fmt.Sprintf(
-		"sudo usermod -aG docker %s && sudo mkdir -p %s && sudo chown -R %s %s",
-		shellQuote(user),
-		shellQuote(workspacePath),
-		shellQuote(user+":"+user),
-		shellQuote(workspacePath),
-	)
+	cmd := buildRemoteWorkspaceSetupCommand(workspacePath, user)
 	return prov.Exec(ctx, []string{"bash", "-c", cmd}, provider.ExecOptions{})
+}
+
+func buildRemoteWorkspaceSetupCommand(workspacePath, user string) string {
+	quotedWorkspace := shellQuote(workspacePath)
+	return strings.Join([]string{
+		fmt.Sprintf("sudo usermod -aG docker %s", shellQuote(user)),
+		fmt.Sprintf("sudo mkdir -p %s", quotedWorkspace),
+		fmt.Sprintf("sudo chown -R %s %s", shellQuote(user+":"+user), quotedWorkspace),
+		fmt.Sprintf("sudo find %s -type d -exec chmod 0777 {} +", quotedWorkspace),
+		fmt.Sprintf("sudo find %s -type f -exec chmod a+rw {} +", quotedWorkspace),
+		fmt.Sprintf(
+			"sudo find %s -type d -exec setfacl -m %s {} +",
+			quotedWorkspace,
+			shellQuote("d:u::rwx,d:g::rwx,d:m::rwx,d:o::rwx"),
+		),
+	}, " && ")
 }
 
 func ensureRemoteProfilePaths(ctx context.Context, prov provider.Provider, activeProfiles []profiles.Spec, user string) error {
@@ -1046,113 +1056,26 @@ done
 `, shellQuote(remotePath), shellQuote(patternArgs))
 }
 
-func ensureAttachedContainerWorkspaceACLs(ctx context.Context, prov provider.Provider, cfg *config.Config, activeProfiles []profiles.Spec) error {
-	workspaceFolder, err := resolveAttachedWorkspaceFolder(cfg)
-	if err != nil {
-		return err
-	}
-	script := buildWorkspaceACLScript(workspaceFolder)
-	return compose.ExecInPrimaryService(ctx, prov, cfg, activeProfiles, script)
+func cleanupLegacyWorkspaceACLWatcher(ctx context.Context, prov provider.Provider, cfg *config.Config, activeProfiles []profiles.Spec) error {
+	return compose.ExecInPrimaryService(ctx, prov, cfg, activeProfiles, legacyWorkspaceACLWatcherCleanupScript())
 }
 
-func resolveAttachedWorkspaceFolder(cfg *config.Config) (string, error) {
-	workspaceFolder := cfg.Compose.WorkspaceFolder
-	if workspaceFolder == "" {
-		detected, err := compose.DetectWorkspaceFolder(cfg, cfg.Compose.PrimaryService)
-		if err != nil {
-			return "", fmt.Errorf("detect workspace folder: %w", err)
-		}
-		workspaceFolder = detected
-	}
-	if workspaceFolder == "" {
-		return "", fmt.Errorf("attached container user requires a workspace folder")
-	}
-	return workspaceFolder, nil
-}
-
-func buildWorkspaceACLScript(workspaceFolder string) string {
-	return fmt.Sprintf(`set -eu
-workspace=%s
-uid=$(stat -c %%u "$workspace")
-repair_debian_packages() {
-  if command -v dpkg >/dev/null 2>&1; then
-    DEBIAN_FRONTEND=noninteractive dpkg --configure -a >/dev/null || true
-  fi
-  if command -v apt-get >/dev/null 2>&1; then
-    DEBIAN_FRONTEND=noninteractive apt-get install -f -y -qq >/dev/null
-  fi
-  if command -v dpkg >/dev/null 2>&1; then
-    DEBIAN_FRONTEND=noninteractive dpkg --configure -a >/dev/null
-  fi
-}
-ensure_acl_tools() {
-  if command -v setfacl >/dev/null 2>&1; then
-    return 0
-  fi
-  if command -v apt-get >/dev/null 2>&1; then
-    repair_debian_packages
-    apt-get update -qq >/dev/null
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq acl >/dev/null
-    return 0
-  fi
-  if command -v apk >/dev/null 2>&1; then
-    apk add --no-cache acl >/dev/null
-    return 0
-  fi
-  if command -v dnf >/dev/null 2>&1; then
-    dnf install -y acl >/dev/null
-    return 0
-  fi
-  if command -v yum >/dev/null 2>&1; then
-    yum install -y acl >/dev/null
-    return 0
-  fi
-  echo "mutapod: could not install ACL tooling in this container" >&2
-  exit 1
-}
-ensure_acl_tools
-apply_workspace_acls() {
-  setfacl -m "u:${uid}:rwX" "$workspace" 2>/dev/null || true
-  setfacl -m "u:0:rwX" "$workspace" 2>/dev/null || true
-  setfacl -m "d:u:${uid}:rwX" "$workspace" 2>/dev/null || true
-  setfacl -m "d:u:0:rwX" "$workspace" 2>/dev/null || true
-  find "$workspace" -exec setfacl -m "u:0:rwX" {} + 2>/dev/null || true
-  find "$workspace" -type d -exec setfacl -m "d:u:0:rwX" {} + 2>/dev/null || true
-  find "$workspace" -uid 0 -exec setfacl -m "u:${uid}:rwX" {} + 2>/dev/null || true
-  find "$workspace" -uid 0 -type d -exec setfacl -m "d:u:${uid}:rwX" {} + 2>/dev/null || true
-}
-apply_workspace_acls
-cat > /tmp/mutapod-acl-watch.sh <<EOF
-#!/bin/sh
-set -eu
-workspace=%s
-uid=$uid
-apply_workspace_acls() {
-  setfacl -m "u:\${uid}:rwX" "\$workspace" 2>/dev/null || true
-  setfacl -m "u:0:rwX" "\$workspace" 2>/dev/null || true
-  setfacl -m "d:u:\${uid}:rwX" "\$workspace" 2>/dev/null || true
-  setfacl -m "d:u:0:rwX" "\$workspace" 2>/dev/null || true
-  find "\$workspace" -type d -exec setfacl -m "d:u:0:rwX" {} + 2>/dev/null || true
-  find "\$workspace" -uid 0 -exec setfacl -m "u:\${uid}:rwX" {} + 2>/dev/null || true
-  find "\$workspace" -uid 0 -type d -exec setfacl -m "d:u:\${uid}:rwX" {} + 2>/dev/null || true
-}
-while :; do
-  apply_workspace_acls
-  sleep 2
-done
-EOF
-chmod 0755 /tmp/mutapod-acl-watch.sh
-if [ -f /tmp/mutapod-acl-watch.pid ]; then
-  old_pid=$(cat /tmp/mutapod-acl-watch.pid 2>/dev/null || true)
-  if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
-    kill "$old_pid" 2>/dev/null || true
-  fi
+func legacyWorkspaceACLWatcherCleanupScript() string {
+	return `set -eu
+pid_file=/tmp/mutapod-acl-watch.pid
+if [ -f "$pid_file" ]; then
+  old_pid=$(cat "$pid_file" 2>/dev/null || true)
+  case "$old_pid" in
+    ''|*[!0-9]*) ;;
+    *)
+      if [ -r "/proc/$old_pid/cmdline" ] &&
+         tr '\000' ' ' <"/proc/$old_pid/cmdline" | grep -Fq '/tmp/mutapod-acl-watch.sh'; then
+        kill "$old_pid" 2>/dev/null || true
+      fi
+      ;;
+  esac
 fi
-nohup /tmp/mutapod-acl-watch.sh >/tmp/mutapod-acl-watch.log 2>&1 &
-echo $! >/tmp/mutapod-acl-watch.pid`,
-		shellQuote(workspaceFolder),
-		shellQuote(workspaceFolder),
-	)
+rm -f "$pid_file" /tmp/mutapod-acl-watch.sh /tmp/mutapod-acl-watch.log`
 }
 
 func shellQuote(s string) string {

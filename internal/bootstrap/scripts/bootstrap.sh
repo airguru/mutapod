@@ -23,6 +23,15 @@ else
     log "docker compose installed: $(docker compose version)"
 fi
 
+if command -v setfacl &>/dev/null; then
+    log "acl tools already installed"
+else
+    log "installing acl tools..."
+    apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends acl
+    log "acl tools installed"
+fi
+
 # ── 3. sshd hardening ────────────────────────────────────────────────────────
 if grep -q "^PasswordAuthentication no" /etc/ssh/sshd_config; then
     log "sshd already hardened"

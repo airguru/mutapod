@@ -208,7 +208,10 @@ specialised package.
                                                for noninteractive access
 11. profiles.Active(cfg)                     — detect codex/claude
 12. bootstrap.Run(ctx, prov)                 — upload + run bootstrap.sh
-13. ensureRemoteWorkspace(...)               — mkdir + chown /workspace/<n>
+13. ensureRemoteWorkspace(...)               — mkdir + chown /workspace/<n>;
+                                               normalize files to a+rw,
+                                               directories to 0777, and set
+                                               inheritable open-access ACLs
 14. ensureRemoteProfilePaths(...)            — for each profile: mkdir +
                                                chown sync + tool dirs
 15. mutagensync.DaemonStart(...)             — `mutagen daemon start`
@@ -233,9 +236,9 @@ specialised package.
 21. compose.Up(...)                          — `docker compose up -d`,
                                                adding `-f override.yaml`
                                                when needed
-22. ensureAttachedContainerWorkspaceACLs     — set ACLs so the attached
-                                               container user can write
-                                               into the synced workspace
+22. cleanupLegacyWorkspaceACLWatcher         — stop and remove the obsolete
+                                               two-second ACL repair process
+                                               from an existing container
 23. compose.ConfigureGitSafeDirectory(...)   — `git config --system --add
                                                safe.directory '*'` inside
                                                the primary container
@@ -356,9 +359,10 @@ ends up here.
 | **Azure private-only default** | Azure VM creation passes `--public-ip-address "" --nsg-rule NONE` unless `provider.azure.public_ip: true` is set. SSH uses the VM private IP by default, so the local machine must have private routing to the target subnet. |
 | **Azure SSH alias** | Azure does not need `az ssh config` for mutapod's noninteractive path. `provider/azure` writes `Host <instance>.azure` with `HostName`, `IdentityFile`, `UserKnownHostsFile`, and `HostKeyAlias`, then trusts the host key in `~/.ssh/known_hosts`. `TrustHost` must replace a stale entry for that alias after VM recreation; merely detecting that the alias already exists leaves Mutagen blocked by OpenSSH host-key verification. |
 | **Mutagen text parsing** | v0.18.1 has no JSON output. `parseSyncStatus` and `parseForwardStatus` walk the human-readable lines looking for `Status:` and normalise to a fixed token set. `isNoSessions(err)` recognises the three different "not found" phrasings mutagen has used. |
-| **Session config signature** | `Manager.SessionConfigSignature` hashes the args mutagen would create the session with. When the signature differs from the saved one, the session is terminated and recreated. The version prefix (`v3` currently) is bumped whenever the args list changes structurally; this forces a one-shot recreation on upgrade. |
+| **Session config signature** | `Manager.SessionConfigSignature` hashes the args mutagen would create the session with. When the signature differs from the saved one, the session is terminated and recreated. The version prefix (`v4` currently) is bumped whenever the args list changes structurally; this forces a one-shot recreation on upgrade. |
 | **Declarative VM fingerprint** | `Config.VMConfigFingerprint` hashes a normalized, versioned provider-specific VM spec. GCP stores it in the `mutapod-config` label and Azure in the same-named tag. A mismatch is handled consistently by replacing the VM; legacy VMs can be explicitly adopted. Target project/zone/subscription/resource-group changes preserve the previous VM instead of deleting across scopes. |
 | **Stale-IP recreation** | When the VM IP changes between runs, mutagen sessions encoded with the old endpoint are terminated and recreated rather than resumed. `state.Instance.LastKnownIP` is the source of truth for the comparison. |
+| **Workspace permissions at creation** | The main Mutagen session explicitly requests beta file mode `0666` and directory mode `0777`. `ensureRemoteWorkspace` installs default open-access ACLs before synchronization, so the VM user and arbitrary container users can share the bind mount without polling. Existing files receive `a+rw` without changing executable bits, and the `v4` session signature recreates older `0600` sessions once. |
 | **Hard-linked `~/.claude.json`** | Mutagen syncs *directories*, not single files. A hard link at `~/.mutapod/profile-links/claude-homefile/claude.json` (same inode as `~/.claude.json`) lets the supplemental sync session sync just that file as if it were in its own directory. The remote bind-mounts the bridged file at `/root/.claude.json`. |
 | **`io.MultiWriter` in debug mode** | When `--debug` is on, `shell.Run` streams stdout/stderr to the user *and* captures it for error inspection. Without this, error matchers like `isNotFound(err)` saw an empty error message and broke. |
 | **Windows binary self-replacement** | A running `mutapod.exe` cannot be overwritten. The updater stages the new binary as `.mutapod.exe.<ts>.new` next to it and launches a detached `cmd.exe /C start /B script.cmd` that retries `move /Y` until the old process exits. The current run continues with the old version; next invocation gets the new one. |

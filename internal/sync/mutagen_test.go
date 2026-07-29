@@ -157,11 +157,35 @@ func TestCreateSync_DisablesGlobalMutagenConfiguration(t *testing.T) {
 		"--label", "mutapod-name=myapp",
 		"--no-global-configuration",
 		"--sync-mode", "two-way-resolved",
+		"--default-file-mode-beta", "0666",
+		"--default-directory-mode-beta", "0777",
 		"--ignore", "mutapod.code-workspace",
 		localDir,
 		"alice@example-host:/workspace/myapp",
 	) {
 		t.Fatalf("expected mutagen sync create with --no-global-configuration, got %#v", fake.Calls)
+	}
+}
+
+func TestSessionConfigSignatureIncludesRemoteWorkspacePermissions(t *testing.T) {
+	manager, _ := testManager()
+	localDir := t.TempDir()
+	manager.cfg.Dir = localDir
+	manager.cfg.Sync.Mode = "two-way-resolved"
+
+	parts, err := manager.sessionConfigSignatureParts(context.Background())
+	if err != nil {
+		t.Fatalf("sessionConfigSignatureParts: %v", err)
+	}
+	joined := strings.Join(parts, "\n")
+	for _, expected := range []string{
+		"v4",
+		"default-file-mode-beta=0666",
+		"default-directory-mode-beta=0777",
+	} {
+		if !strings.Contains(joined, expected) {
+			t.Fatalf("session signature missing %q:\n%s", expected, joined)
+		}
 	}
 }
 
