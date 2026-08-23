@@ -34,17 +34,29 @@ func TestShouldRefreshProfileSessionWithMatchingSignature(t *testing.T) {
 	}
 }
 
-func TestCodexRuntimeSQLiteCleanupCommandMovesDatabasesOutsideProfile(t *testing.T) {
-	cmd := codexRuntimeSQLiteCleanupCommand("/var/lib/mutapod/profiles/codex")
+func TestEffectiveProfileSyncMode(t *testing.T) {
+	if got := effectiveProfileSyncMode("two-way-safe", "two-way-resolved"); got != "two-way-safe" {
+		t.Fatalf("explicit profile mode: got %q", got)
+	}
+	if got := effectiveProfileSyncMode("", "two-way-resolved"); got != "two-way-resolved" {
+		t.Fatalf("inherited profile mode: got %q", got)
+	}
+}
+
+func TestCodexProfileMigrationQuarantinesNonPortableStateOnce(t *testing.T) {
+	cmd := codexProfileMigrationCommand(
+		"/var/lib/mutapod/profiles/codex",
+		"/var/lib/mutapod/runtime/codex-sqlite",
+	)
 
 	for _, expected := range []string{
 		"profile='/var/lib/mutapod/profiles/codex'",
-		"backup_root=/var/lib/mutapod/profile-backups/codex-runtime-sqlite",
-		"logs_*.sqlite",
-		"goals_*.sqlite",
-		"memories_*.sqlite",
-		"state_*.sqlite",
-		"sudo mv \"$f\" \"$backup\"/",
+		"runtime='/var/lib/mutapod/runtime/codex-sqlite'",
+		"marker=\"$runtime/.portable-profile-v1\"",
+		"sessions|archived_sessions|attachments|generated_images|visualizations|memories|rules|skills|AGENTS.md|auth.json|config.toml",
+		"/var/lib/mutapod/profile-backups/codex-runtime/",
+		"sudo mv \"$entry\" \"$backup\"/",
+		"sudo touch \"$marker\"",
 	} {
 		if !strings.Contains(cmd, expected) {
 			t.Fatalf("cleanup command missing %q:\n%s", expected, cmd)

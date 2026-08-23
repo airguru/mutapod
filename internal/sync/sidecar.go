@@ -45,12 +45,14 @@ func (s *SidecarSession) SessionName() string { return s.spec.SessionName }
 
 func (s *SidecarSession) ConfigSignature() string {
 	parts := []string{
-		"v1",
+		"v2",
 		"session=" + s.spec.SessionName,
 		"label=" + s.spec.Label,
 		"mode=" + s.spec.Mode,
 		"local=" + s.spec.LocalPath,
 		"remote=" + s.remote(),
+		"default-file-mode-beta=" + remoteDefaultFileMode,
+		"default-directory-mode-beta=" + remoteDefaultDirectoryMode,
 	}
 	if s.spec.IgnoreVCS {
 		parts = append(parts, "ignore-vcs=true")
@@ -123,6 +125,8 @@ func (s *SidecarSession) create(ctx context.Context) error {
 		"--label", s.spec.Label,
 		"--no-global-configuration",
 		"--sync-mode", s.spec.Mode,
+		"--default-file-mode-beta", remoteDefaultFileMode,
+		"--default-directory-mode-beta", remoteDefaultDirectoryMode,
 	}
 	if s.spec.IgnoreVCS {
 		args = append(args, "--ignore-vcs")

@@ -3,6 +3,8 @@ package cli
 import (
 	"strings"
 	"testing"
+
+	"github.com/mutapod/mutapod/internal/profiles"
 )
 
 func TestBuildRemoteWorkspaceSetupCommandUsesOpenInheritedPermissions(t *testing.T) {
@@ -22,6 +24,36 @@ func TestBuildRemoteWorkspaceSetupCommandUsesOpenInheritedPermissions(t *testing
 	}
 	if strings.Contains(command, "-type f -exec chmod 0777") {
 		t.Fatalf("workspace setup must not make every regular file executable:\n%s", command)
+	}
+}
+
+func TestBuildRemoteProfileSetupCommandUsesOpenInheritedPermissions(t *testing.T) {
+	command := buildRemoteProfileSetupCommand([]profiles.Spec{
+		{
+			Name:              "codex",
+			SyncRemotePath:    "/var/lib/mutapod/profiles/codex",
+			ToolRemotePath:    "/var/lib/mutapod/tools/codex",
+			RuntimeRemotePath: "/var/lib/mutapod/runtime/codex-sqlite",
+		},
+	}, "azureuser")
+
+	for _, path := range []string{
+		"/var/lib/mutapod/profiles/codex",
+		"/var/lib/mutapod/tools/codex",
+		"/var/lib/mutapod/runtime/codex-sqlite",
+	} {
+		for _, template := range []string{
+			"sudo mkdir -p '%s'",
+			"sudo chown -R 'azureuser:azureuser' '%s'",
+			"sudo find '%s' -type d -exec chmod 0777 {} +",
+			"sudo find '%s' -type f -exec chmod a+rw {} +",
+			"sudo find '%s' -type d -exec setfacl -m 'd:u::rwx,d:g::rwx,d:m::rwx,d:o::rwx' {} +",
+		} {
+			needle := strings.Replace(template, "%s", path, 1)
+			if !strings.Contains(command, needle) {
+				t.Fatalf("profile setup command missing %q:\n%s", needle, command)
+			}
+		}
 	}
 }
 

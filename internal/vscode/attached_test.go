@@ -182,6 +182,9 @@ services:
 	if got.RemoteEnv["CODEX_HOME"] != profiles.RootHomeDir+"/.codex" {
 		t.Fatalf("CODEX_HOME: got %q", got.RemoteEnv["CODEX_HOME"])
 	}
+	if got.RemoteEnv["CODEX_SQLITE_HOME"] != "/var/lib/mutapod/runtime/codex-sqlite" {
+		t.Fatalf("CODEX_SQLITE_HOME: got %q", got.RemoteEnv["CODEX_SQLITE_HOME"])
+	}
 	if got.RemoteEnv["CLAUDE_CONFIG_DIR"] != profiles.RootHomeDir+"/.claude" {
 		t.Fatalf("CLAUDE_CONFIG_DIR: got %q", got.RemoteEnv["CLAUDE_CONFIG_DIR"])
 	}

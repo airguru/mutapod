@@ -33,6 +33,8 @@ func TestSidecarEnsure_CreateUsesExpectedFlags(t *testing.T) {
 		"--label", "mutapod-name=demo-profile-codex",
 		"--no-global-configuration",
 		"--sync-mode", "two-way-resolved",
+		"--default-file-mode-beta", "0666",
+		"--default-directory-mode-beta", "0777",
 		"--ignore", "cache",
 		"--ignore", "cache/**",
 		`C:\Users\pavel\.codex`,

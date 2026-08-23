@@ -213,7 +213,9 @@ specialised package.
                                                directories to 0777, and set
                                                inheritable open-access ACLs
 14. ensureRemoteProfilePaths(...)            — for each profile: mkdir +
-                                               chown sync + tool dirs
+                                               chown sync/tool/runtime dirs;
+                                               normalize 0666/0777 access and
+                                               inheritable open ACLs
 15. mutagensync.DaemonStart(...)             — `mutagen daemon start`
 16. EnsureSync                               — recreate if IP changed,
                                                ignore-rules changed, or
@@ -222,10 +224,13 @@ specialised package.
 17. waitForInitialSync(...)                  — flush + verify ready + wait
                                                for the remote compose file
                                                to appear
-18. Per-profile SidecarSession.Ensure        — same logic, plus the
-                                               supplemental claude-homefile
-                                               sync that bridges
-                                               ~/.claude.json
+18. Per-profile SidecarSession.Ensure        — same logic and remote 0666/0777
+                                               defaults; Codex uses two-way-safe
+                                               with a portable-data allowlist,
+                                               then performs a one-time backup
+                                               migration of old runtime entries;
+                                               Claude adds a supplemental sync
+                                               bridging ~/.claude.json
 19. removeRemoteWorkspaceWrapper(...)        — delete the .code-workspace
                                                file from the remote so it
                                                doesn't recurse

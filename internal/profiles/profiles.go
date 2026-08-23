@@ -32,9 +32,11 @@ type Mount struct {
 type Spec struct {
 	Name              string
 	SessionName       string
+	SyncMode          string
 	LocalPath         string
 	SyncRemotePath    string
 	ToolRemotePath    string
+	RuntimeRemotePath string
 	Mounts            []Mount
 	SupplementalSyncs []SupplementalSync
 	IgnorePatterns    []string
@@ -51,6 +53,7 @@ type Spec struct {
 type SupplementalSync struct {
 	Name           string
 	SessionName    string
+	SyncMode       string
 	LocalPath      string
 	RemotePath     string
 	IgnorePatterns []string
@@ -118,12 +121,15 @@ func (s Spec) AttachedContainerRemoteEnv() map[string]string {
 // RemoteDirectories returns every VM directory mutapod should create for this
 // profile.
 func (s Spec) RemoteDirectories() []string {
-	dirs := make([]string, 0, 2)
+	dirs := make([]string, 0, 3)
 	if s.SyncRemotePath != "" {
 		dirs = append(dirs, s.SyncRemotePath)
 	}
 	if s.ToolRemotePath != "" {
 		dirs = append(dirs, s.ToolRemotePath)
+	}
+	if s.RuntimeRemotePath != "" {
+		dirs = append(dirs, s.RuntimeRemotePath)
 	}
 	for _, extra := range s.SupplementalSyncs {
 		if extra.RemotePath != "" {
@@ -145,8 +151,11 @@ type nodeProfileDefinition struct {
 	defaultLocalHome       string
 	defaultSyncRemotePath  string
 	defaultToolRemotePath  string
+	defaultRuntimePath     string
 	defaultConfigMountPath string
 	defaultToolMountPath   string
+	defaultRuntimeMount    string
+	syncMode               string
 	ignorePatterns         []string
 	needsSandboxNamespaces bool
 	configSelector         func(*config.Config) config.ProfileSyncConfig
@@ -185,6 +194,7 @@ func (d nodeProfileDefinition) Detect(cfg *config.Config) (Spec, bool, error) {
 		syncRemotePath = d.defaultSyncRemotePath
 	}
 	toolRemotePath := filepath.ToSlash(strings.TrimSpace(d.defaultToolRemotePath))
+	runtimeRemotePath := filepath.ToSlash(strings.TrimSpace(d.defaultRuntimePath))
 	mountPath := profileCfg.MountPath
 	if mountPath == "" {
 		mountPath = d.defaultConfigMountPath
@@ -193,9 +203,11 @@ func (d nodeProfileDefinition) Detect(cfg *config.Config) (Spec, bool, error) {
 
 	spec := Spec{
 		Name:                   d.name,
+		SyncMode:               d.syncMode,
 		LocalPath:              localHomePath,
 		SyncRemotePath:         syncRemotePath,
 		ToolRemotePath:         toolRemotePath,
+		RuntimeRemotePath:      runtimeRemotePath,
 		IgnorePatterns:         append([]string(nil), d.ignorePatterns...),
 		LocalBinaryPath:        localBinaryPath,
 		NeedsSandboxNamespaces: d.needsSandboxNamespaces,
@@ -203,6 +215,12 @@ func (d nodeProfileDefinition) Detect(cfg *config.Config) (Spec, bool, error) {
 			{RemotePath: syncRemotePath, ContainerPath: mountPath},
 			{RemotePath: toolRemotePath, ContainerPath: toolMountPath},
 		},
+	}
+	if runtimeRemotePath != "" && d.defaultRuntimeMount != "" {
+		spec.Mounts = append(spec.Mounts, Mount{
+			RemotePath:    runtimeRemotePath,
+			ContainerPath: d.defaultRuntimeMount,
+		})
 	}
 	if localHomePath != "" {
 		spec.SessionName = fmt.Sprintf("mutapod-%s-profile-%s", cfg.Name, d.name)
@@ -236,38 +254,32 @@ func newCodexDefinition() Definition {
 		defaultLocalHome:       ".codex",
 		defaultSyncRemotePath:  "/var/lib/mutapod/profiles/codex",
 		defaultToolRemotePath:  "/var/lib/mutapod/tools/codex",
+		defaultRuntimePath:     "/var/lib/mutapod/runtime/codex-sqlite",
 		defaultConfigMountPath: RootHomeDir + "/.codex",
 		defaultToolMountPath:   "/var/lib/mutapod/tools/codex",
+		defaultRuntimeMount:    "/var/lib/mutapod/runtime/codex-sqlite",
+		syncMode:               "two-way-safe",
 		configSelector: func(cfg *config.Config) config.ProfileSyncConfig {
 			return cfg.Profiles.Codex
 		},
 		binaryFallback:         detectCodexFromVSCodeExtension,
 		needsSandboxNamespaces: true,
 		ignorePatterns: []string{
-			".sandbox",
-			".sandbox/**",
-			".sandbox-bin",
-			".sandbox-bin/**",
-			".sandbox-secrets",
-			".sandbox-secrets/**",
-			".tmp",
-			".tmp/**",
-			"tmp",
-			"tmp/**",
-			"cache",
-			"cache/**",
-			"goals_*.sqlite",
-			"goals_*.sqlite-shm",
-			"goals_*.sqlite-wal",
-			"logs_*.sqlite",
-			"logs_*.sqlite-shm",
-			"logs_*.sqlite-wal",
-			"memories_*.sqlite",
-			"memories_*.sqlite-shm",
-			"memories_*.sqlite-wal",
-			"state_*.sqlite",
-			"state_*.sqlite-shm",
-			"state_*.sqlite-wal",
+			// Codex's home mixes portable profile data with platform-local runtime
+			// state. Start ignored and explicitly admit only durable task history,
+			// referenced artifacts, and user-authored configuration/customizations.
+			"/*",
+			"!/sessions/",
+			"!/archived_sessions/",
+			"!/attachments/",
+			"!/generated_images/",
+			"!/visualizations/",
+			"!/memories/",
+			"!/rules/",
+			"!/skills/",
+			"!/AGENTS.md",
+			"!/auth.json",
+			"!/config.toml",
 		},
 		settingsBuilder: func(spec Spec) map[string]any {
 			return map[string]any{
@@ -277,17 +289,24 @@ func newCodexDefinition() Definition {
 		setupScriptBuilder: func(spec Spec, pkg string) string {
 			configMount := spec.Mounts[0].ContainerPath
 			toolMount := spec.Mounts[1].ContainerPath
+			runtimeMount := spec.Mounts[2].ContainerPath
 			return nodeProfileSetupScript(nodeProfileSetup{
 				PackageName: pkg,
 				ToolPrefix:  toolMount,
 				BinaryName:  "codex",
 				WrapperName: "codex",
-				WrapperBody: fmt.Sprintf("export CODEX_HOME=%s\nexec %s/bin/codex \"$@\"", shString(configMount), shString(toolMount)),
+				WrapperBody: fmt.Sprintf(
+					"export CODEX_HOME=%s\nexport CODEX_SQLITE_HOME=%s\nexec %s/bin/codex \"$@\"",
+					shString(configMount),
+					shString(runtimeMount),
+					shString(toolMount),
+				),
 			})
 		},
 		remoteEnvBuilder: func(spec Spec) map[string]string {
 			return map[string]string{
-				"CODEX_HOME": spec.Mounts[0].ContainerPath,
+				"CODEX_HOME":        spec.Mounts[0].ContainerPath,
+				"CODEX_SQLITE_HOME": spec.Mounts[2].ContainerPath,
 			}
 		},
 	}

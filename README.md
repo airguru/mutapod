@@ -333,7 +333,7 @@ In the normal case, you do not need to configure this section at all.
 If `codex` or `claude` is installed locally and available on your `PATH`, mutapod will:
 
 - detect it automatically
-- sync its local home directory if present
+- sync its portable local profile data if present
 - mount that data into the primary container
 - install the matching CLI inside the primary container automatically on `mutapod up`
 
@@ -356,11 +356,18 @@ Behavior:
 - mutapod auto-enables Claude Code when local `claude` is installed
 - mutapod creates extra Mutagen sync sessions for the enabled profiles when local profile data exists
 - these syncs are separate from the project workspace sync
-- Codex SQLite runtime databases such as `logs_*.sqlite`, `state_*.sqlite`, `goals_*.sqlite`, and `memories_*.sqlite` are not synced, because Codex may rewrite or validate them differently across platform-specific extension binaries
+- Codex profile sync is allowlisted: durable task JSONL (`sessions` and `archived_sessions`), referenced artifacts (`attachments`, `generated_images`, and `visualizations`), memory/rules/skills, plus `AGENTS.md`, `auth.json`, and `config.toml`
+- all other Codex home entries are environment-local by default, so current and future SQLite databases, WAL/SHM/journal files, queues, IPC, locks, caches, and machine identity/UI state cannot cross between Windows and Linux
+- Codex receives a separate `CODEX_SQLITE_HOME` at `/var/lib/mutapod/runtime/codex-sqlite`; this persistent VM directory is mounted into the container but is never synchronized
+- Codex profile sync always uses Mutagen `two-way-safe`, independent of the project workspace mode, so simultaneous conflicting edits stop for review instead of silently choosing one side
+- the first `mutapod up` after this migration moves old non-portable remote profile entries to a timestamped directory under `/var/lib/mutapod/profile-backups/codex-runtime`; it does not delete them or alter the local profile
 - when `compose.primary_service` is set, mutapod mounts the synced profile directories into that service through the generated remote compose override
 - mutapod also creates a persistent tool directory on the VM for each active profile and installs the corresponding CLI in the primary container automatically
-- the Codex CLI wrapper exports `CODEX_HOME` to the mounted profile data for terminal use; the VS Code Codex extension is left to use its bundled CLI
+- the Codex CLI wrapper and VS Code attached-container profile export both `CODEX_HOME` and `CODEX_SQLITE_HOME`; the VS Code Codex extension is left to use its bundled CLI
+- profile roots use the same development-friendly `0666`/`0777` synchronization modes and inheritable open ACLs as the workspace, so the SSH user and root-run container processes can both access portable files without changing the container user model
 - Claude Code is launched through a wrapper that gives it a stable managed `HOME`, so its `~/.claude` data comes from the mounted profile automatically
+
+Do not actively write the same Codex task from two machines at once. The durable JSONL task history is portable, but a single task file is still a single-writer record; `two-way-safe` is a guardrail, not multi-writer merging.
 
 Current limitations:
 

@@ -292,7 +292,7 @@ func runUpWithConfig(ctx context.Context, cfg *config.Config, launchMode vscode.
 				Label:          "mutapod-name=" + cfg.Name + "-profile-" + spec.Name,
 				LocalPath:      spec.LocalPath,
 				RemotePath:     spec.SyncRemotePath,
-				Mode:           cfg.Sync.Mode,
+				Mode:           effectiveProfileSyncMode(spec.SyncMode, cfg.Sync.Mode),
 				IgnorePatterns: spec.IgnorePatterns,
 			}, sshCfg, mutagenPath, shell.DefaultCommander)
 			signature := session.ConfigSignature()
@@ -320,8 +320,8 @@ func runUpWithConfig(ctx context.Context, cfg *config.Config, launchMode vscode.
 				return err
 			}
 			if spec.Name == "codex" {
-				if err := cleanupRemoteCodexRuntimeSQLite(ctx, prov, spec.SyncRemotePath); err != nil {
-					return fmt.Errorf("profile codex runtime SQLite cleanup: %w", err)
+				if err := migrateRemoteCodexProfile(ctx, prov, spec.SyncRemotePath, spec.RuntimeRemotePath); err != nil {
+					return fmt.Errorf("profile codex portable-data migration: %w", err)
 				}
 			}
 			profileStates = append(profileStates, state.ProfileSyncState{
@@ -337,7 +337,7 @@ func runUpWithConfig(ctx context.Context, cfg *config.Config, launchMode vscode.
 					Label:          "mutapod-name=" + cfg.Name + "-profile-" + extra.Name,
 					LocalPath:      extra.LocalPath,
 					RemotePath:     extra.RemotePath,
-					Mode:           cfg.Sync.Mode,
+					Mode:           effectiveProfileSyncMode(extra.SyncMode, cfg.Sync.Mode),
 					IgnorePatterns: extra.IgnorePatterns,
 				}, sshCfg, mutagenPath, shell.DefaultCommander)
 				extraSignature := extraSession.ConfigSignature()
@@ -907,18 +907,28 @@ func ensureRemoteProfilePaths(ctx context.Context, prov provider.Provider, activ
 	if len(activeProfiles) == 0 {
 		return nil
 	}
+	return prov.Exec(ctx, []string{"bash", "-c", buildRemoteProfileSetupCommand(activeProfiles, user)}, provider.ExecOptions{})
+}
 
+func buildRemoteProfileSetupCommand(activeProfiles []profiles.Spec, user string) string {
 	parts := []string{fmt.Sprintf("sudo usermod -aG docker %s", shellQuote(user))}
 	for _, profile := range activeProfiles {
 		for _, remotePath := range profile.RemoteDirectories() {
+			quotedPath := shellQuote(remotePath)
 			parts = append(parts,
-				fmt.Sprintf("sudo mkdir -p %s", shellQuote(remotePath)),
-				fmt.Sprintf("sudo chown -R %s %s", shellQuote(user+":"+user), shellQuote(remotePath)),
+				fmt.Sprintf("sudo mkdir -p %s", quotedPath),
+				fmt.Sprintf("sudo chown -R %s %s", shellQuote(user+":"+user), quotedPath),
+				fmt.Sprintf("sudo find %s -type d -exec chmod 0777 {} +", quotedPath),
+				fmt.Sprintf("sudo find %s -type f -exec chmod a+rw {} +", quotedPath),
+				fmt.Sprintf(
+					"sudo find %s -type d -exec setfacl -m %s {} +",
+					quotedPath,
+					shellQuote("d:u::rwx,d:g::rwx,d:m::rwx,d:o::rwx"),
+				),
 			)
 		}
 	}
-	cmd := strings.Join(parts, " && ")
-	return prov.Exec(ctx, []string{"bash", "-c", cmd}, provider.ExecOptions{})
+	return strings.Join(parts, " && ")
 }
 
 type composeProfileRunner struct {
@@ -953,6 +963,13 @@ func shouldRefreshProfileSession(prior state.ProfileSyncState, found bool, signa
 		return true
 	}
 	return prior.SessionConfig == "" || prior.SessionConfig != signature
+}
+
+func effectiveProfileSyncMode(profileMode, workspaceMode string) string {
+	if mode := strings.TrimSpace(profileMode); mode != "" {
+		return mode
+	}
+	return workspaceMode
 }
 
 func shouldPrepareAttachedContainerExtensionInstall(cfg *config.Config) bool {
@@ -998,62 +1015,43 @@ if [ "$needs_restart" -eq 1 ]; then
 fi`
 }
 
-func cleanupRemoteCodexRuntimeSQLite(ctx context.Context, prov provider.Provider, remotePath string) error {
-	remotePath = strings.TrimSpace(remotePath)
-	if remotePath == "" {
+func migrateRemoteCodexProfile(ctx context.Context, prov provider.Provider, profilePath, runtimePath string) error {
+	profilePath = strings.TrimSpace(profilePath)
+	runtimePath = strings.TrimSpace(runtimePath)
+	if profilePath == "" || runtimePath == "" {
 		return nil
 	}
-	return prov.Exec(ctx, []string{"bash", "-c", codexRuntimeSQLiteCleanupCommand(remotePath)}, provider.ExecOptions{})
+	return prov.Exec(ctx, []string{"bash", "-c", codexProfileMigrationCommand(profilePath, runtimePath)}, provider.ExecOptions{})
 }
 
-func codexRuntimeSQLiteCleanupCommand(remotePath string) string {
-	patterns := []string{
-		"goals_*.sqlite",
-		"goals_*.sqlite-shm",
-		"goals_*.sqlite-wal",
-		"logs_*.sqlite",
-		"logs_*.sqlite-shm",
-		"logs_*.sqlite-wal",
-		"memories_*.sqlite",
-		"memories_*.sqlite-shm",
-		"memories_*.sqlite-wal",
-		"state_*.sqlite",
-		"state_*.sqlite-shm",
-		"state_*.sqlite-wal",
-	}
-	patternArgs := strings.Join(patterns, " ")
+func codexProfileMigrationCommand(profilePath, runtimePath string) string {
 	return fmt.Sprintf(`set -eu
 profile=%s
-if [ ! -d "$profile" ]; then
+runtime=%s
+marker="$runtime/.portable-profile-v1"
+if [ -e "$marker" ]; then
   exit 0
 fi
-patterns=%s
-found=0
-for pattern in $patterns; do
-  for f in "$profile"/$pattern; do
-    if [ -e "$f" ]; then
-      found=1
-      break
-    fi
-  done
-  if [ "$found" -eq 1 ]; then
-    break
+sudo mkdir -p "$profile" "$runtime"
+backup=''
+for entry in "$profile"/* "$profile"/.[!.]* "$profile"/..?*; do
+  if [ ! -e "$entry" ] && [ ! -L "$entry" ]; then
+    continue
   fi
+  name=${entry##*/}
+  case "$name" in
+    sessions|archived_sessions|attachments|generated_images|visualizations|memories|rules|skills|AGENTS.md|auth.json|config.toml)
+      continue
+      ;;
+  esac
+  if [ -z "$backup" ]; then
+    backup="/var/lib/mutapod/profile-backups/codex-runtime/$(date -u +%%Y%%m%%dT%%H%%M%%SZ)-$$"
+    sudo mkdir -p "$backup"
+  fi
+  sudo mv "$entry" "$backup"/
 done
-if [ "$found" -eq 0 ]; then
-  exit 0
-fi
-backup_root=/var/lib/mutapod/profile-backups/codex-runtime-sqlite
-backup="$backup_root/$(date -u +%%Y%%m%%dT%%H%%M%%SZ)"
-sudo mkdir -p "$backup"
-for pattern in $patterns; do
-  for f in "$profile"/$pattern; do
-    if [ -e "$f" ]; then
-      sudo mv "$f" "$backup"/
-    fi
-  done
-done
-`, shellQuote(remotePath), shellQuote(patternArgs))
+sudo touch "$marker"
+`, shellQuote(profilePath), shellQuote(runtimePath))
 }
 
 func cleanupLegacyWorkspaceACLWatcher(ctx context.Context, prov provider.Provider, cfg *config.Config, activeProfiles []profiles.Spec) error {

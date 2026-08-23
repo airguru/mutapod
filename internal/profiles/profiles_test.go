@@ -81,7 +81,7 @@ func TestClaudeProfileIncludesCompanionFileAndWrapperEnv(t *testing.T) {
 	}
 }
 
-func TestCodexProfileIgnoresSQLiteRuntimeState(t *testing.T) {
+func TestCodexProfileSyncsOnlyPortableDataAndSeparatesRuntimeState(t *testing.T) {
 	tmp := t.TempDir()
 	home := filepath.Join(tmp, "home")
 	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0755); err != nil {
@@ -120,28 +120,48 @@ func TestCodexProfileIgnoresSQLiteRuntimeState(t *testing.T) {
 	if !codex.NeedsSandboxNamespaces {
 		t.Fatalf("codex profile should request sandbox namespace support")
 	}
+	if codex.SyncMode != "two-way-safe" {
+		t.Fatalf("SyncMode: got %q, want two-way-safe", codex.SyncMode)
+	}
+	if codex.RuntimeRemotePath != "/var/lib/mutapod/runtime/codex-sqlite" {
+		t.Fatalf("RuntimeRemotePath: got %q", codex.RuntimeRemotePath)
+	}
+	if got := len(codex.Mounts); got != 3 {
+		t.Fatalf("Mounts: got %d, want 3", got)
+	}
+	if codex.Mounts[2].ContainerPath != "/var/lib/mutapod/runtime/codex-sqlite" {
+		t.Fatalf("runtime mount: got %#v", codex.Mounts[2])
+	}
 
 	patterns := make(map[string]bool, len(codex.IgnorePatterns))
 	for _, pattern := range codex.IgnorePatterns {
 		patterns[pattern] = true
 	}
 	for _, expected := range []string{
-		"goals_*.sqlite",
-		"goals_*.sqlite-shm",
-		"goals_*.sqlite-wal",
-		"logs_*.sqlite",
-		"logs_*.sqlite-shm",
-		"logs_*.sqlite-wal",
-		"memories_*.sqlite",
-		"memories_*.sqlite-shm",
-		"memories_*.sqlite-wal",
-		"state_*.sqlite",
-		"state_*.sqlite-shm",
-		"state_*.sqlite-wal",
+		"/*",
+		"!/sessions/",
+		"!/archived_sessions/",
+		"!/attachments/",
+		"!/generated_images/",
+		"!/visualizations/",
+		"!/memories/",
+		"!/rules/",
+		"!/skills/",
+		"!/AGENTS.md",
+		"!/auth.json",
+		"!/config.toml",
 	} {
 		if !patterns[expected] {
 			t.Fatalf("IgnorePatterns missing %q", expected)
 		}
+	}
+	script := codex.SetupScript()
+	if !strings.Contains(script, "export CODEX_SQLITE_HOME='/var/lib/mutapod/runtime/codex-sqlite'") {
+		t.Fatalf("SetupScript missing CODEX_SQLITE_HOME export:\n%s", script)
+	}
+	env := codex.AttachedContainerRemoteEnv()
+	if env["CODEX_SQLITE_HOME"] != "/var/lib/mutapod/runtime/codex-sqlite" {
+		t.Fatalf("CODEX_SQLITE_HOME: got %q", env["CODEX_SQLITE_HOME"])
 	}
 }
 
