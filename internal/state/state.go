@@ -9,6 +9,7 @@ type State struct {
 	SchemaVersion int    `json:"schema_version"`
 	Name          string `json:"name"`
 	ProviderType  string `json:"provider_type"`
+	LaunchMode    string `json:"launch_mode,omitempty"`
 
 	Instance     InstanceState      `json:"instance"`
 	SSH          SSHState           `json:"ssh"`

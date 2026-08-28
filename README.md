@@ -17,7 +17,7 @@ GCP and Azure are supported providers today.
 
 - `mutapod up`: create or start the VM, sync files, run `docker compose up`, forward ports, configure VS Code workspace integration, start lease tracking, and open VS Code attached to the main container by default
 - `mutapod up local`: same as `mutapod up`, but open the local `mutapod.code-workspace` instead of the attached-container window
-- `mutapod up headless`: same startup/sync/service/forwarding flow as `mutapod up`, but skip VS Code launch and keep the VM lease alive with at least a one-hour expiry
+- `mutapod up headless`: provision the VM, sync only the project workspace, run services, configure the Docker context and forwards, and keep the lease alive with at least a one-hour expiry; it does not detect or sync personal AI profiles and performs no VS Code preparation or launch
 - `mutapod up --build`: same as `mutapod up`, but force `docker compose` to rebuild images before starting services
 - `mutapod up --replace`: approve recreation when VM-facing YAML changed
 - `mutapod up --adopt`: mark an existing legacy VM as matching the current YAML without recreating it
@@ -40,7 +40,7 @@ GCP and Azure are supported providers today.
 4. Add a `mutapod.yaml` to your project.
 5. Run `mutapod up`, or choose a provider explicitly with `mutapod --provider azure up`.
 6. If you prefer the local workspace wrapper instead of attached-container mode, run `mutapod up local`.
-7. If you want the VM running for a remote-controlled agent without opening VS Code, run `mutapod up headless`.
+7. If you want the VM running for a local agent to control through `mutapod ssh` or `mutapod exec`, without AI-profile sync or any VS Code work, run `mutapod up headless`.
 8. If you need a fresh image rebuild, use `mutapod up --build`.
 
 Mutagen is downloaded automatically into `~/.mutapod/bin` if it is not already available on `PATH`.
@@ -326,7 +326,7 @@ When `primary_service` is set, `mutapod up` also pre-generates the VS Code attac
 
 ### `profiles`
 
-`profiles` lets mutapod detect selected personal AI-agent setups on your machine, sync their data outside the repo workspace, and bootstrap matching CLIs inside the primary container automatically.
+`profiles` lets normal `container` and `local` launches detect selected personal AI-agent setups on your machine, sync their data outside the repo workspace, and bootstrap matching CLIs inside the primary container automatically. Headless launches skip this subsystem completely.
 
 In the normal case, you do not need to configure this section at all.
 
@@ -352,6 +352,7 @@ Supported keys today:
 
 Behavior:
 
+- `mutapod up headless` does not detect, prepare, sync, mount, migrate, or install personal AI profiles; when switching from another mode, it terminates profile sync sessions recorded by the previous launch
 - mutapod auto-enables Codex when local `codex` is installed
 - mutapod auto-enables Claude Code when local `claude` is installed
 - mutapod creates extra Mutagen sync sessions for the enabled profiles when local profile data exists
@@ -406,9 +407,11 @@ If you want the local workspace wrapper instead, run:
 
 - `mutapod up local`
 
-If you want to start the VM, sync files, run services, and refresh the idle lease without launching VS Code, run:
+If you want to start the VM, sync the project, run services, and refresh the idle lease without any VS Code preparation or personal AI-profile sync, run:
 
 - `mutapod up headless`
+
+The headless path still performs runtime work needed by a local agent: VM bootstrap, project Mutagen sync, Compose startup, Git safe-directory setup, the project Docker context, configured port/reverse forwards, and lease/idle management. Use `mutapod ssh` for VM commands and `mutapod exec -- <command>` for commands in `compose.primary_service`.
 
 `mutapod up` also creates or updates a named Docker context for the workspace. The generated workspace then points VS Code at that context and keeps terminal access aligned with it.
 

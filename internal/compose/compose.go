@@ -561,13 +561,10 @@ func volumeMatchesWorkspace(source, composeDir, localSyncPath string) bool {
 }
 
 // Up runs `docker compose up -d` on the remote VM via SSH.
-// If build is true, `--build` is included.
-func Up(ctx context.Context, p provider.Provider, cfg *config.Config, build bool) error {
+// If build is true, `--build` is included. activeProfiles must match the
+// profiles used to generate the remote override for this launch mode.
+func Up(ctx context.Context, p provider.Provider, cfg *config.Config, activeProfiles []profiles.Spec, build bool) error {
 	workspacePath := cfg.WorkspacePath()
-	activeProfiles, err := profiles.Active(cfg)
-	if err != nil {
-		return err
-	}
 	includeOverride, err := NeedsRemoteOverride(cfg, activeProfiles)
 	if err != nil {
 		return err
@@ -667,14 +664,10 @@ func ExecInPrimaryServiceWithOptions(ctx context.Context, p provider.Provider, c
 	})
 }
 
-// Down runs `docker compose down` on the remote VM via SSH.
-func Down(ctx context.Context, p provider.Provider, cfg *config.Config) error {
+// Down runs `docker compose down` on the remote VM via SSH. activeProfiles
+// must match the launch mode that created the running Compose project.
+func Down(ctx context.Context, p provider.Provider, cfg *config.Config, activeProfiles []profiles.Spec) error {
 	workspacePath := cfg.WorkspacePath()
-	activeProfiles, err := profiles.Active(cfg)
-	if err != nil {
-		shell.Debugf("compose: profile detection for down: %v", err)
-		activeProfiles = nil
-	}
 	includeOverride, err := NeedsRemoteOverride(cfg, activeProfiles)
 	if err != nil {
 		return err

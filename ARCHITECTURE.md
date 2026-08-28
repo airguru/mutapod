@@ -48,9 +48,10 @@ Five non-obvious decisions shape the codebase:
    `EnsureInstance / State / SSHConfig / Exec / CopyFile / StopInstance /
    DeleteInstance`. Pure-Go SSH is reached through `Exec` and `CopyFile`.
 
-4. **A remote compose override is generated on every `up`.** mutapod injects
-   bind mounts for the synced workspace and for any active personal AI profile
-   (codex/claude) into the primary service. The override is YAML, written to
+4. **A remote compose override is generated when needed.** mutapod injects
+   bind mounts for the synced workspace and, outside headless mode, for any
+   active personal AI profile (codex/claude) into the primary service. The
+   override is YAML, written to
    the remote workspace as `.mutapod.compose.override.yaml`, and `docker compose
    up` is invoked with both `-f compose.yaml -f .mutapod.compose.override.yaml`.
    This works even with compose files that weren't written for mutapod.
@@ -136,10 +137,10 @@ internal/
                             mutapod block (managed by Go, delimited by
                             HTML comments)
 
-  vscode/                   generates mutapod.code-workspace, the attached-
-                            container imageConfig (Dev Containers), and
-                            launches VS Code in attached/local mode or
-                            skips launch in headless mode
+  vscode/                   for attached/local mode, generates
+                            mutapod.code-workspace and the attached-container
+                            imageConfig (Dev Containers), then launches VS Code;
+                            the package is not called during headless startup
 
   dockerctx/                creates/updates a project-scoped Docker context
                             named like the GCP instance, pointing at
@@ -150,7 +151,8 @@ internal/
                             lister; local heartbeat lock via gofrs/flock
 
   state/                    JSON state in ~/.mutapod/state/<name>.json:
-                            instance ID, last known IP, sync session names,
+                            launch mode, instance ID, last known IP, sync
+                            session names,
                             forward session map, profile session list,
                             ignore signature, sync session config signature
 
@@ -183,7 +185,7 @@ specialised package.
 ```
 1.  parseUpLaunchMode(args)                  — "" or "container" → attached;
                                                "local" → open code-workspace;
-                                               "headless" → skip VS Code
+                                               "headless" → no profiles or VS Code
 2.  loadConfig()                             — find mutapod.yaml walking up;
                                                provider.type is the default
                                                provider unless --provider
@@ -206,13 +208,16 @@ specialised package.
                                                queries VM IP and writes its own
                                                Host block; both TrustHost()
                                                for noninteractive access
-11. profiles.Active(cfg)                     — detect codex/claude
+11. activeProfilesForLaunchMode(...)         — detect codex/claude for attached
+                                               and local modes; return no
+                                               profiles in headless mode
 12. bootstrap.Run(ctx, prov)                 — upload + run bootstrap.sh
 13. ensureRemoteWorkspace(...)               — mkdir + chown /workspace/<n>;
                                                normalize files to a+rw,
                                                directories to 0777, and set
                                                inheritable open-access ACLs
-14. ensureRemoteProfilePaths(...)            — for each profile: mkdir +
+14. ensureRemoteProfilePaths(...)            — outside headless, for each
+                                               profile: mkdir +
                                                chown sync/tool/runtime dirs;
                                                normalize 0666/0777 access and
                                                inheritable open ACLs
@@ -224,14 +229,16 @@ specialised package.
 17. waitForInitialSync(...)                  — flush + verify ready + wait
                                                for the remote compose file
                                                to appear
-18. Per-profile SidecarSession.Ensure        — same logic and remote 0666/0777
+18. Per-profile SidecarSession.Ensure        — outside headless, same logic and
+                                               remote 0666/0777
                                                defaults; Codex uses two-way-safe
                                                with a portable-data allowlist,
                                                then performs a one-time backup
                                                migration of old runtime entries;
                                                Claude adds a supplemental sync
                                                bridging ~/.claude.json
-19. removeRemoteWorkspaceWrapper(...)        — delete the .code-workspace
+19. removeRemoteWorkspaceWrapper(...)        — outside headless, delete the
+                                               .code-workspace
                                                file from the remote so it
                                                doesn't recurse
 20. compose.EnsureRemoteOverride(...)        — render + upload
@@ -247,7 +254,8 @@ specialised package.
 23. compose.ConfigureGitSafeDirectory(...)   — `git config --system --add
                                                safe.directory '*'` inside
                                                the primary container
-24. profiles.EnsureRemoteTools(...)          — runs each profile's setup
+24. profiles.EnsureRemoteTools(...)          — outside headless, runs each
+                                               profile's setup
                                                script in the primary
                                                container (npm install of
                                                codex/claude CLI + wrapper
@@ -255,21 +263,29 @@ specialised package.
 25. compose.ParsePorts + EnsureForward       — one mutagen forward per
                                                port, named mutapod-<n>-<p>
 26. EnsureReverseForward (if configured)     — for cfg.Compose.ReverseForwards
-27. state.Save(st)                           — persist everything
+27. state.Save(st)                           — persist everything, including
+                                               the selected launch mode
 28. dockerctx.EnsureContext(...)             — create/update Docker context
                                                pointing at ssh://...
-29. vscode.ConfigureWorkspace(...)           — generate
+29. vscode.ConfigureWorkspace(...)           — outside headless, generate
                                                mutapod.code-workspace
-30. vscode.ConfigureAttachedContainer(...)   — generate the Dev Containers
+30. vscode.ConfigureAttachedContainer(...)   — outside headless, generate the
+                                               Dev Containers
                                                imageConfig JSON in user
                                                globalStorage
 31. maybeConfigureIdle(...)                  — install systemd timer,
                                                write lease, start local
                                                heartbeat process; headless
                                                uses at least a one-hour lease
-32. vscode.PrintInstructions + Launch(...)   — open VS Code (attached or
-                                               local) or skip in headless
+32. vscode.PrintInstructions + Launch(...)   — outside headless, open VS Code
+                                               (attached or local); headless
+                                               reports `ssh`/`exec` readiness
 ```
+
+When headless follows a normal launch, it terminates the profile Mutagen
+sessions saved by that launch and writes an empty profile list. `mutapod exec`
+and `mutapod down` consult the persisted launch mode so they keep using the
+same profile-free Compose override instead of re-detecting local AI profiles.
 
 `mutapod down` is the inverse for state-changing steps:
 - `compose.Down`

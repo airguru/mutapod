@@ -157,7 +157,7 @@ func runUpWithConfig(ctx context.Context, cfg *config.Config, launchMode vscode.
 
 	ipChanged := st.Instance.LastKnownIP != "" && st.Instance.LastKnownIP != sshCfg.IP
 
-	activeProfiles, err := profiles.Active(cfg)
+	activeProfiles, err := activeProfilesForLaunchMode(cfg, launchMode)
 	if err != nil {
 		return err
 	}
@@ -207,12 +207,14 @@ func runUpWithConfig(ctx context.Context, cfg *config.Config, launchMode vscode.
 		}
 		shell.Debugf("IP changed (%s -> %s), recreating Mutagen sessions", st.Instance.LastKnownIP, sshCfg.IP)
 		syncMgr.TerminateAllSessions(ctx, forwardPorts, reversePorts)
-		for _, profileState := range st.Profiles {
-			if profileState.SessionName == "" {
-				continue
-			}
-			_ = mutagensync.TerminateSyncSession(ctx, mutagenPath, shell.DefaultCommander, profileState.SessionName)
+		if launchModeUsesProfiles(launchMode) {
+			terminateSavedProfileSyncs(ctx, mutagenPath, shell.DefaultCommander, st.Profiles)
 		}
+	}
+	if !launchModeUsesProfiles(launchMode) && len(st.Profiles) > 0 {
+		step("Stopping personal AI profile syncs for headless mode...")
+		terminateSavedProfileSyncs(ctx, mutagenPath, shell.DefaultCommander, st.Profiles)
+		ok("Personal AI profile syncs stopped")
 	}
 	if st.Sync.IgnoreSignature != "" && st.Sync.IgnoreSignature != ignoreSignature {
 		shell.Debugf("ignore rules changed, recreating Mutagen sync session")
@@ -376,8 +378,10 @@ func runUpWithConfig(ctx context.Context, cfg *config.Config, launchMode vscode.
 		ok("Personal AI profiles synced: %s", strings.Join(profileNames(activeProfiles), ", "))
 	}
 
-	if err := removeRemoteWorkspaceWrapper(ctx, prov, cfg); err != nil {
-		shell.Debugf("remove remote workspace wrapper: %v", err)
+	if launchModeUsesVSCode(launchMode) {
+		if err := removeRemoteWorkspaceWrapper(ctx, prov, cfg); err != nil {
+			shell.Debugf("remove remote workspace wrapper: %v", err)
+		}
 	}
 
 	if len(cfg.Compose.ReverseForwards) > 0 {
@@ -402,7 +406,7 @@ func runUpWithConfig(ctx context.Context, cfg *config.Config, launchMode vscode.
 	}
 
 	step("Starting services (docker compose up)...")
-	if err := compose.Up(ctx, prov, cfg, buildImages); err != nil {
+	if err := compose.Up(ctx, prov, cfg, activeProfiles, buildImages); err != nil {
 		return err
 	}
 	ok("Services running")
@@ -501,6 +505,7 @@ func runUpWithConfig(ctx context.Context, cfg *config.Config, launchMode vscode.
 
 	st.Name = cfg.Name
 	st.ProviderType = cfg.Provider.Type
+	st.LaunchMode = string(launchMode)
 	st.Instance.ID = instanceMetadata.ID
 	st.Instance.Name = cfg.InstanceName()
 	st.Instance.TargetScope = targetScope(cfg, instanceMetadata.ID)
@@ -529,26 +534,28 @@ func runUpWithConfig(ctx context.Context, cfg *config.Config, launchMode vscode.
 		shell.Debugf("warning: save state: %v", err)
 	}
 
-	step("Configuring local VS Code workspace...")
-	workspaceFile, err := vscode.ConfigureWorkspace(cfg, sshCfg, dockerContext)
-	if err != nil {
-		return err
-	}
-	ok("VS Code workspace configured: %s", workspaceFile)
+	if launchModeUsesVSCode(launchMode) {
+		step("Configuring local VS Code workspace...")
+		workspaceFile, err := vscode.ConfigureWorkspace(cfg, sshCfg, dockerContext)
+		if err != nil {
+			return err
+		}
+		ok("VS Code workspace configured: %s", workspaceFile)
 
-	attachedConfigPath, err := vscode.ConfigureAttachedContainer(ctx, cfg, dockerContext, activeProfiles, shell.DefaultCommander)
-	if err != nil {
-		return err
-	}
-	if attachedConfigPath != "" {
-		ok("Attached-container defaults configured: %s", attachedConfigPath)
-		if shouldPrepareAttachedContainerExtensionInstall(cfg) {
-			step("Preparing attached-container extension install...")
-			if err := prepareAttachedContainerExtensionInstall(ctx, prov, cfg, activeProfiles); err != nil {
-				shell.Debugf("attached-container extension install prep: %v", err)
-				fmt.Fprintf(os.Stderr, "  warning: could not prepare attached-container extension install: %v\n", err)
-			} else {
-				ok("Attached-container extension install ready")
+		attachedConfigPath, err := vscode.ConfigureAttachedContainer(ctx, cfg, dockerContext, activeProfiles, shell.DefaultCommander)
+		if err != nil {
+			return err
+		}
+		if attachedConfigPath != "" {
+			ok("Attached-container defaults configured: %s", attachedConfigPath)
+			if shouldPrepareAttachedContainerExtensionInstall(cfg) {
+				step("Preparing attached-container extension install...")
+				if err := prepareAttachedContainerExtensionInstall(ctx, prov, cfg, activeProfiles); err != nil {
+					shell.Debugf("attached-container extension install prep: %v", err)
+					fmt.Fprintf(os.Stderr, "  warning: could not prepare attached-container extension install: %v\n", err)
+				} else {
+					ok("Attached-container extension install ready")
+				}
 			}
 		}
 	}
@@ -559,10 +566,10 @@ func runUpWithConfig(ctx context.Context, cfg *config.Config, launchMode vscode.
 	idleRefresher.Stop()
 	idleRefresher = nil
 
-	vscode.PrintInstructions(cfg, sshCfg, ports, launchMode)
-	if launchMode == vscode.LaunchHeadless {
-		ok("VS Code launch skipped (headless)")
+	if !launchModeUsesVSCode(launchMode) {
+		ok("Headless environment ready; use mutapod ssh or mutapod exec")
 	} else {
+		vscode.PrintInstructions(cfg, sshCfg, ports, launchMode)
 		step("Opening VS Code (%s)...", launchMode)
 		if err := vscode.Launch(ctx, cfg, dockerContext, launchMode, shell.DefaultCommander); err != nil {
 			fmt.Fprintf(os.Stderr, "  warning: VS Code launch failed: %v\n", err)
@@ -615,7 +622,12 @@ func runDown(_ *cobra.Command, _ []string) error {
 	}
 
 	step("Stopping services (docker compose down)...")
-	if err := compose.Down(ctx, prov, cfg); err != nil {
+	activeProfiles, err := activeProfilesForLaunchMode(cfg, vscode.LaunchMode(st.LaunchMode))
+	if err != nil {
+		shell.Debugf("compose: profile detection for down: %v", err)
+		activeProfiles = nil
+	}
+	if err := compose.Down(ctx, prov, cfg, activeProfiles); err != nil {
 		shell.Debugf("compose down: %v", err)
 	}
 
@@ -780,7 +792,11 @@ func runExec(ctx context.Context, cfg *config.Config, prov provider.Provider, ar
 	if _, err := prov.SSHConfig(ctx); err != nil {
 		return err
 	}
-	activeProfiles, err := profiles.Active(cfg)
+	st, err := state.Load(cfg.Name)
+	if err != nil {
+		return err
+	}
+	activeProfiles, err := activeProfilesForLaunchMode(cfg, vscode.LaunchMode(st.LaunchMode))
 	if err != nil {
 		return err
 	}
@@ -956,6 +972,32 @@ func profileStateKeys(activeProfiles []profiles.Spec) []string {
 		}
 	}
 	return keys
+}
+
+func activeProfilesForLaunchMode(cfg *config.Config, launchMode vscode.LaunchMode) ([]profiles.Spec, error) {
+	if !launchModeUsesProfiles(launchMode) {
+		return nil, nil
+	}
+	return profiles.Active(cfg)
+}
+
+func launchModeUsesProfiles(launchMode vscode.LaunchMode) bool {
+	return launchMode != vscode.LaunchHeadless
+}
+
+func launchModeUsesVSCode(launchMode vscode.LaunchMode) bool {
+	return launchMode != vscode.LaunchHeadless
+}
+
+func terminateSavedProfileSyncs(ctx context.Context, mutagenPath string, cmd shell.Commander, profileStates []state.ProfileSyncState) {
+	for _, profileState := range profileStates {
+		if profileState.SessionName == "" {
+			continue
+		}
+		if err := mutagensync.TerminateSyncSession(ctx, mutagenPath, cmd, profileState.SessionName); err != nil {
+			shell.Debugf("terminate profile sync %s: %v", profileState.Name, err)
+		}
+	}
 }
 
 func shouldRefreshProfileSession(prior state.ProfileSyncState, found bool, signature string) bool {

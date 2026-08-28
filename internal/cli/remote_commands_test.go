@@ -2,11 +2,15 @@ package cli
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/mutapod/mutapod/internal/config"
 	"github.com/mutapod/mutapod/internal/provider"
+	"github.com/mutapod/mutapod/internal/state"
+	"github.com/mutapod/mutapod/internal/vscode"
 )
 
 type commandProvider struct {
@@ -104,6 +108,7 @@ func TestCommandScriptQuotesArguments(t *testing.T) {
 }
 
 func TestRunExecUsesPrimaryServiceContainer(t *testing.T) {
+	setTempStateHome(t)
 	prov := &commandProvider{}
 	disabled := false
 	cfg := &config.Config{
@@ -144,4 +149,49 @@ func TestRunExecUsesPrimaryServiceContainer(t *testing.T) {
 			t.Fatalf("remote command missing %q:\n%s", expected, remote)
 		}
 	}
+}
+
+func TestRunExecAfterHeadlessLaunchSkipsProfileDetectionAndMounts(t *testing.T) {
+	setTempStateHome(t)
+	badProfilePath := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(badProfilePath, []byte("test"), 0600); err != nil {
+		t.Fatalf("write profile path: %v", err)
+	}
+	enabled := true
+	cfg := &config.Config{
+		Name: "headless-exec",
+		Dir:  t.TempDir(),
+		Compose: config.ComposeConfig{
+			PrimaryService: "web",
+		},
+		Profiles: config.ProfilesConfig{
+			Codex: config.ProfileSyncConfig{
+				Enabled:   &enabled,
+				LocalPath: badProfilePath,
+			},
+		},
+	}
+	if err := state.Save(&state.State{
+		SchemaVersion: state.SchemaVersion,
+		Name:          cfg.Name,
+		LaunchMode:    string(vscode.LaunchHeadless),
+	}); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+	prov := &commandProvider{}
+
+	if err := runExec(context.Background(), cfg, prov, []string{"python", "manage.py", "check"}); err != nil {
+		t.Fatalf("runExec: %v", err)
+	}
+	remote := prov.execCmd[2]
+	if strings.Contains(remote, ".mutapod.compose.override.yaml") {
+		t.Fatalf("headless exec unexpectedly selected a profile override:\n%s", remote)
+	}
+}
+
+func setTempStateHome(t *testing.T) {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 }

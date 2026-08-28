@@ -25,6 +25,7 @@ func TestSaveLoad(t *testing.T) {
 		SchemaVersion: SchemaVersion,
 		Name:          "myapp",
 		ProviderType:  "gcp",
+		LaunchMode:    "headless",
 		Instance: InstanceState{
 			ID:                "projects/p/zones/z/instances/mutapod-myapp",
 			Name:              "mutapod-myapp",
@@ -60,6 +61,9 @@ func TestSaveLoad(t *testing.T) {
 	}
 	if loaded.ProviderType != "gcp" {
 		t.Errorf("ProviderType: got %q", loaded.ProviderType)
+	}
+	if loaded.LaunchMode != "headless" {
+		t.Errorf("LaunchMode: got %q", loaded.LaunchMode)
 	}
 	if loaded.Instance.ID != s.Instance.ID {
 		t.Errorf("Instance.ID: got %q", loaded.Instance.ID)
