@@ -2,7 +2,9 @@ package azure
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"os"
 	"os/exec"
@@ -204,6 +206,43 @@ func TestEnsureInstance_CreateNewWithPublicIP(t *testing.T) {
 	}
 }
 
+func TestEnsureInstanceRestartsVMThatWasStopping(t *testing.T) {
+	cfg := testConfig()
+	powerStateCalls := 0
+	cmd := &callbackCommander{}
+	cmd.output = func(_ context.Context, _ shell.RunOptions, name string, args ...string) ([]byte, error) {
+		joined := strings.Join(args, " ")
+		switch {
+		case name == "az" && strings.Contains(joined, "--query powerState"):
+			powerStateCalls++
+			switch powerStateCalls {
+			case 1:
+				return []byte("VM stopping\n"), nil
+			case 2:
+				return []byte("VM stopped\n"), nil
+			default:
+				return []byte("VM running\n"), nil
+			}
+		case name == "az" && strings.Contains(joined, "--scripts "+azureStartupGuardScript):
+			return []byte("mutapod:startup-guard-active:restart\n"), nil
+		default:
+			return nil, nil
+		}
+	}
+	p := New(cfg, cmd)
+
+	state, err := p.EnsureInstance(context.Background())
+	if err != nil {
+		t.Fatalf("EnsureInstance: %v", err)
+	}
+	if state != provider.StateRunning {
+		t.Fatalf("state: got %q, want %q", state, provider.StateRunning)
+	}
+	if !cmd.calledWith("az", "vm", "start") {
+		t.Fatalf("expected stopping VM to be restarted, calls: %#v", cmd.calls)
+	}
+}
+
 func TestSSHConfig(t *testing.T) {
 	stubSSHFunctions(t, func(context.Context, *sshrun.Client) error { return nil })
 
@@ -320,6 +359,19 @@ func TestSSHConfigRepairsRejectedManagedKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	keySum := sha256.Sum256([]byte(identity.PublicKey))
+	confirmation := "mutapod:ssh-key-installed:" + identity.Marker + ":" + hex.EncodeToString(keySum[:]) + ":1\n"
+	f.Stub(confirmation, "az",
+		"vm", "run-command", "invoke",
+		"--resource-group", "rg-dev",
+		"--name", instanceName,
+		"--command-id", "RunShellScript",
+		"--scripts", azureAuthorizedKeysScript,
+		"--parameters", "azureuser", base64.RawStdEncoding.EncodeToString([]byte(identity.PublicKey)), identity.Marker,
+		"--query", "value[0].message",
+		"--output", "tsv",
+		"--subscription", "sub-123",
+	)
 	if _, err := p.SSHConfig(context.Background()); err != nil {
 		t.Fatalf("SSHConfig: %v", err)
 	}
@@ -338,10 +390,166 @@ func TestSSHConfigRepairsRejectedManagedKey(t *testing.T) {
 		"--command-id", "RunShellScript",
 		"--scripts", azureAuthorizedKeysScript,
 		"--parameters", "azureuser", wantKey, identity.Marker,
-		"--output", "none",
+		"--query", "value[0].message",
+		"--output", "tsv",
 		"--subscription", "sub-123",
 	) {
 		t.Fatalf("expected Azure Run Command key repair, got %#v", f.Calls)
+	}
+}
+
+func TestSSHConfigResetsDeadlineAfterSlowKeyRepair(t *testing.T) {
+	tempHome(t)
+	oldTimeout := sshReadyTimeout
+	oldRetryPeriod := sshReadyRetryPeriod
+	sshReadyTimeout = 25 * time.Millisecond
+	sshReadyRetryPeriod = time.Millisecond
+	t.Cleanup(func() {
+		sshReadyTimeout = oldTimeout
+		sshReadyRetryPeriod = oldRetryPeriod
+	})
+
+	attempts := 0
+	stubSSHFunctions(t, func(context.Context, *sshrun.Client) error {
+		attempts++
+		switch attempts {
+		case 1:
+			return errors.New("ssh: handshake failed: ssh: unable to authenticate, attempted methods [none publickey], no supported methods remain")
+		case 2:
+			return errors.New("dial tcp 10.1.2.3:22: i/o timeout")
+		default:
+			return nil
+		}
+	})
+
+	cfg := testConfig()
+	p := New(cfg, nil)
+	identity, err := p.sshIdentity(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	keySum := sha256.Sum256([]byte(identity.PublicKey))
+	confirmation := "mutapod:ssh-key-installed:" + identity.Marker + ":" + hex.EncodeToString(keySum[:]) + ":1\n"
+	p.cmd = &callbackCommander{output: func(_ context.Context, _ shell.RunOptions, name string, args ...string) ([]byte, error) {
+		joined := strings.Join(args, " ")
+		switch {
+		case name == "az" && strings.Contains(joined, "--query privateIps"):
+			return []byte("10.1.2.3\n"), nil
+		case name == "az" && strings.Contains(joined, "--scripts "+azureAuthorizedKeysScript):
+			time.Sleep(35 * time.Millisecond)
+			return []byte(confirmation), nil
+		case name == "az" && strings.Contains(joined, "--query powerState"):
+			return []byte("VM running\n"), nil
+		default:
+			return nil, nil
+		}
+	}}
+
+	if _, err := p.SSHConfig(context.Background()); err != nil {
+		t.Fatalf("SSHConfig after slow repair: %v", err)
+	}
+	if attempts != 3 {
+		t.Fatalf("SSH probe attempts: got %d, want 3", attempts)
+	}
+}
+
+func TestSSHConfigRestartsVMStoppedDuringKeyVerification(t *testing.T) {
+	tempHome(t)
+	attempts := 0
+	stubSSHFunctions(t, func(context.Context, *sshrun.Client) error {
+		attempts++
+		switch attempts {
+		case 1:
+			return errors.New("ssh: handshake failed: ssh: unable to authenticate, attempted methods [none publickey], no supported methods remain")
+		case 2:
+			return errors.New("dial tcp 10.1.2.3:22: i/o timeout")
+		default:
+			return nil
+		}
+	})
+
+	cfg := testConfig()
+	p := New(cfg, nil)
+	identity, err := p.sshIdentity(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	keySum := sha256.Sum256([]byte(identity.PublicKey))
+	confirmation := "mutapod:ssh-key-installed:" + identity.Marker + ":" + hex.EncodeToString(keySum[:]) + ":1\n"
+	powerStateCalls := 0
+	cmd := &callbackCommander{}
+	cmd.output = func(_ context.Context, _ shell.RunOptions, name string, args ...string) ([]byte, error) {
+		joined := strings.Join(args, " ")
+		switch {
+		case name == "az" && strings.Contains(joined, "--query privateIps"):
+			return []byte("10.1.2.3\n"), nil
+		case name == "az" && strings.Contains(joined, "--scripts "+azureAuthorizedKeysScript):
+			return []byte(confirmation), nil
+		case name == "az" && strings.Contains(joined, "--query powerState"):
+			powerStateCalls++
+			if powerStateCalls <= 2 {
+				return []byte("VM stopped\n"), nil
+			}
+			return []byte("VM running\n"), nil
+		case name == "az" && strings.Contains(joined, "--scripts "+azureStartupGuardScript):
+			return []byte("mutapod:startup-guard-active:restart\n"), nil
+		default:
+			return nil, nil
+		}
+	}
+	p.cmd = cmd
+
+	if _, err := p.SSHConfig(context.Background()); err != nil {
+		t.Fatalf("SSHConfig after stopped VM recovery: %v", err)
+	}
+	if attempts != 3 {
+		t.Fatalf("SSH probe attempts: got %d, want 3", attempts)
+	}
+	if !cmd.calledWith("az", "vm", "start") {
+		t.Fatalf("expected stopped VM to be restarted, calls: %#v", cmd.calls)
+	}
+}
+
+func TestRepairSSHAccessRequiresGuestConfirmation(t *testing.T) {
+	p := New(testConfig(), shell.NewFakeCommander())
+	err := p.repairSSHAccess(context.Background(), &sshIdentity{
+		PublicKey: "ssh-ed25519 AAAAcurrent",
+		Marker:    "mutapod-test",
+	})
+	if err == nil || !strings.Contains(err.Error(), "did not confirm") {
+		t.Fatalf("expected missing confirmation error, got %v", err)
+	}
+}
+
+func TestEnsureStartupGuardUsesIdleMode(t *testing.T) {
+	tests := []struct {
+		name    string
+		enabled *bool
+		mode    string
+	}{
+		{name: "default enabled", mode: "restart"},
+		{name: "disabled", enabled: boolPtr(false), mode: "disable"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := testConfig()
+			cfg.Idle.Enabled = tt.enabled
+			f := shell.NewFakeCommander()
+			f.Stub("mutapod:startup-guard-active:"+tt.mode+"\n", "az",
+				"vm", "run-command", "invoke",
+				"--resource-group", "rg-dev",
+				"--name", cfg.InstanceName(),
+				"--command-id", "RunShellScript",
+				"--scripts", azureStartupGuardScript,
+				"--parameters", tt.mode,
+				"--query", "value[0].message",
+				"--output", "tsv",
+				"--subscription", "sub-123",
+			)
+			if err := New(cfg, f).ensureStartupGuard(context.Background()); err != nil {
+				t.Fatalf("ensureStartupGuard: %v", err)
+			}
+		})
 	}
 }
 
@@ -570,9 +778,10 @@ func TestAuthorizedKeysScriptPreservesUnrelatedKeysAndIsIdempotent(t *testing.T)
 	}
 
 	writeExecutable(t, filepath.Join(bin, "getent"), "#!/bin/sh\nprintf 'test:x:1000:1000::%s:/bin/sh\\n' \"$MUTAPOD_TEST_HOME\"\n")
-	writeExecutable(t, filepath.Join(bin, "id"), "#!/bin/sh\nprintf 'testgroup\\n'\n")
+	writeExecutable(t, filepath.Join(bin, "id"), "#!/bin/sh\ncase \"$1\" in\n  -gn) printf 'testgroup\\n' ;;\n  -u) printf '1000\\n' ;;\n  *) exit 1 ;;\nesac\n")
 	writeExecutable(t, filepath.Join(bin, "chown"), "#!/bin/sh\nexit 0\n")
 	writeExecutable(t, filepath.Join(bin, "install"), "#!/bin/sh\nfor arg do target=\"$arg\"; done\nmkdir -p \"$target\"\nchmod 700 \"$target\"\n")
+	writeExecutable(t, filepath.Join(bin, "sshd"), "#!/bin/sh\nprintf 'pubkeyauthentication yes\\nauthorizedkeysfile %%h/.ssh/authorized_keys %%h/.ssh/authorized_keys2\\n'\n")
 
 	publicKey := "ssh-ed25519 AAAAcurrent"
 	encoded := base64.RawStdEncoding.EncodeToString([]byte(publicKey))
@@ -626,6 +835,13 @@ func TestAuthorizedKeysScriptPreservesUnrelatedKeysAndIsIdempotent(t *testing.T)
 	}
 	if strings.Count(text, publicKey+" "+marker) != 1 {
 		t.Fatalf("managed key is not idempotent:\n%s", text)
+	}
+	secondData, err := os.ReadFile(filepath.Join(sshDir, "authorized_keys2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(secondData), publicKey+" "+marker) != 1 {
+		t.Fatalf("managed key missing from secondary effective path:\n%s", secondData)
 	}
 }
 
@@ -779,4 +995,50 @@ func isWSLBash(bash string) bool {
 
 func shellTestQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
+}
+
+type callbackCommander struct {
+	calls  []shell.Call
+	run    func(context.Context, shell.RunOptions, string, ...string) error
+	output func(context.Context, shell.RunOptions, string, ...string) ([]byte, error)
+}
+
+func (c *callbackCommander) Run(ctx context.Context, opts shell.RunOptions, name string, args ...string) error {
+	c.calls = append(c.calls, shell.Call{Name: name, Args: append([]string(nil), args...), Opts: opts})
+	if c.run != nil {
+		return c.run(ctx, opts, name, args...)
+	}
+	return nil
+}
+
+func (c *callbackCommander) Output(ctx context.Context, opts shell.RunOptions, name string, args ...string) ([]byte, error) {
+	c.calls = append(c.calls, shell.Call{Name: name, Args: append([]string(nil), args...), Opts: opts})
+	if c.output != nil {
+		return c.output(ctx, opts, name, args...)
+	}
+	return nil, nil
+}
+
+func (c *callbackCommander) calledWith(name string, requiredArgs ...string) bool {
+	for _, call := range c.calls {
+		if call.Name != name {
+			continue
+		}
+		joined := " " + strings.Join(call.Args, " ") + " "
+		matches := true
+		for _, arg := range requiredArgs {
+			if !strings.Contains(joined, " "+arg+" ") {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			return true
+		}
+	}
+	return false
+}
+
+func boolPtr(value bool) *bool {
+	return &value
 }

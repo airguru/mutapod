@@ -89,7 +89,13 @@ func InstallRemote(ctx context.Context, p provider.Provider) error {
 
 func EnableTimer(ctx context.Context, p provider.Provider) error {
 	return retrySSHReady(ctx, "enable idle timer", func() error {
-		return p.Exec(ctx, []string{"bash", "-c", "sudo systemctl enable --now mutapod-idle-check.timer"}, provider.ExecOptions{})
+		return p.Exec(ctx, []string{"bash", "-c", "sudo systemctl stop 'mutapod-startup-guard-*.timer' 2>/dev/null || true; sudo systemctl enable --now mutapod-idle-check.timer"}, provider.ExecOptions{})
+	})
+}
+
+func DisableTimer(ctx context.Context, p provider.Provider) error {
+	return retrySSHReady(ctx, "disable idle timer", func() error {
+		return p.Exec(ctx, []string{"bash", "-c", "sudo systemctl stop 'mutapod-startup-guard-*.timer' 2>/dev/null || true; sudo systemctl disable --now mutapod-idle-check.timer 2>/dev/null || true"}, provider.ExecOptions{})
 	})
 }
 

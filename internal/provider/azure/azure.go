@@ -38,6 +38,9 @@ var (
 //go:embed scripts/ensure_authorized_key.sh
 var azureAuthorizedKeysScript string
 
+//go:embed scripts/startup_guard.sh
+var azureStartupGuardScript string
+
 func init() {
 	provider.Register("azure", func(cfg *config.Config, cmd shell.Commander) (provider.Provider, error) {
 		return New(cfg, cmd), nil
@@ -115,11 +118,21 @@ func (p *Provider) EnsureInstance(ctx context.Context) (provider.InstanceState, 
 	if err != nil {
 		return provider.StateUnknown, err
 	}
+	if state == provider.StateStopping {
+		shell.Debugf("azure: VM %s is stopping; waiting before restart", p.name)
+		state, err = p.waitForStoppedOrRunning(ctx)
+		if err != nil {
+			return state, err
+		}
+	}
 
 	switch state {
 	case provider.StateRunning:
 		shell.Debugf("azure: VM %s is already running", p.name)
 		if err := p.ensureSSHNSGRule(ctx); err != nil {
+			return provider.StateUnknown, err
+		}
+		if err := p.ensureStartupGuard(ctx); err != nil {
 			return provider.StateUnknown, err
 		}
 		return provider.StateRunning, nil
@@ -136,7 +149,7 @@ func (p *Provider) EnsureInstance(ctx context.Context) (provider.InstanceState, 
 			return provider.StateUnknown, err
 		}
 
-	case provider.StateStarting, provider.StateStopping:
+	case provider.StateStarting:
 		shell.Debugf("azure: VM %s is transitioning (%s), waiting...", p.name, state)
 
 	default:
@@ -150,7 +163,54 @@ func (p *Provider) EnsureInstance(ctx context.Context) (provider.InstanceState, 
 	if err := p.ensureSSHNSGRule(ctx); err != nil {
 		return provider.StateUnknown, err
 	}
+	if state != provider.StateNotFound {
+		if err := p.ensureStartupGuard(ctx); err != nil {
+			return provider.StateUnknown, err
+		}
+	}
 	return runningState, nil
+}
+
+func (p *Provider) ensureStartupGuard(ctx context.Context) error {
+	mode := "disable"
+	if p.cfg.Idle.IsEnabled() {
+		mode = "restart"
+	}
+	args := []string{
+		"vm", "run-command", "invoke",
+		"--resource-group", p.cfg.Provider.Azure.ResourceGroup,
+		"--name", p.name,
+		"--command-id", "RunShellScript",
+		"--scripts", azureStartupGuardScript,
+		"--parameters", mode,
+		"--query", "value[0].message",
+		"--output", "tsv",
+	}
+	args = p.withSubscription(args)
+	wantActive := "mutapod:startup-guard-active:" + mode
+	wantNotNeeded := "mutapod:startup-guard-not-needed:" + mode
+
+	deadline := time.Now().Add(sshReadyTimeout)
+	for {
+		out, err := p.cmd.Output(ctx, shell.RunOptions{}, "az", args...)
+		if err == nil {
+			message := string(out)
+			if strings.Contains(message, wantActive) || strings.Contains(message, wantNotNeeded) {
+				shell.Debugf("azure: pre-SSH startup guard confirmed (%s)", mode)
+				return nil
+			}
+			return fmt.Errorf("azure: startup guard confirmation missing from Run Command output")
+		}
+		if !isRunCommandRetryable(err) || time.Now().After(deadline) {
+			return fmt.Errorf("azure: configure pre-SSH startup guard: %w", err)
+		}
+		shell.Debugf("azure: waiting to configure pre-SSH startup guard: %v", err)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(5 * time.Second):
+		}
+	}
 }
 
 func (p *Provider) createVM(ctx context.Context) error {
@@ -370,10 +430,29 @@ func (p *Provider) ensureSSHAuthentication(ctx context.Context, client *sshrun.C
 		if sshrun.IsAuthenticationError(err) && !repaired {
 			shell.Debugf("azure: SSH key rejected; reconciling managed access through Azure Run Command")
 			if repairErr := p.repairSSHAccess(ctx, identity); repairErr != nil {
+				restarted, recoverErr := p.recoverStoppedInstance(ctx)
+				if recoverErr != nil {
+					return fmt.Errorf("azure: recover VM stopped during SSH key repair: %w", recoverErr)
+				}
+				if restarted {
+					deadline = time.Now().Add(sshReadyTimeout)
+					continue
+				}
 				return fmt.Errorf("azure: repair SSH access after key rejection: %w", repairErr)
 			}
 			repaired = true
+			deadline = time.Now().Add(sshReadyTimeout)
 			continue
+		}
+		if isSSHConnectivityError(err) {
+			restarted, recoverErr := p.recoverStoppedInstance(ctx)
+			if recoverErr != nil {
+				return fmt.Errorf("azure: recover VM stopped during SSH setup: %w", recoverErr)
+			}
+			if restarted {
+				deadline = time.Now().Add(sshReadyTimeout)
+				continue
+			}
 		}
 		if !isSSHStartupError(err) || time.Now().After(deadline) {
 			if repaired {
@@ -397,6 +476,8 @@ func (p *Provider) repairSSHAccess(ctx context.Context, identity *sshIdentity) e
 	// name=value pairs. Use unpadded Base64 so the public key remains the
 	// script's second positional argument.
 	publicKeyB64 := base64.RawStdEncoding.EncodeToString([]byte(identity.PublicKey))
+	keySum := sha256.Sum256([]byte(identity.PublicKey))
+	wantConfirmation := fmt.Sprintf("mutapod:ssh-key-installed:%s:%s", identity.Marker, hex.EncodeToString(keySum[:]))
 	args := []string{
 		"vm", "run-command", "invoke",
 		"--resource-group", az.ResourceGroup,
@@ -404,14 +485,19 @@ func (p *Provider) repairSSHAccess(ctx context.Context, identity *sshIdentity) e
 		"--command-id", "RunShellScript",
 		"--scripts", azureAuthorizedKeysScript,
 		"--parameters", az.AdminUsername, publicKeyB64, identity.Marker,
-		"--output", "none",
+		"--query", "value[0].message",
+		"--output", "tsv",
 	}
 	args = p.withSubscription(args)
 
 	deadline := time.Now().Add(sshReadyTimeout)
 	for {
-		err := p.cmd.Run(ctx, shell.RunOptions{}, "az", args...)
+		out, err := p.cmd.Output(ctx, shell.RunOptions{}, "az", args...)
 		if err == nil {
+			if !strings.Contains(string(out), wantConfirmation) {
+				return fmt.Errorf("Run Command did not confirm the installed managed SSH key")
+			}
+			shell.Debugf("azure: managed SSH key installation confirmed by Run Command")
 			return nil
 		}
 		if !isRunCommandRetryable(err) || time.Now().After(deadline) {
@@ -421,6 +507,55 @@ func (p *Provider) repairSSHAccess(ctx context.Context, identity *sshIdentity) e
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-time.After(5 * time.Second):
+		}
+	}
+}
+
+func (p *Provider) recoverStoppedInstance(ctx context.Context) (bool, error) {
+	state, err := p.State(ctx)
+	if err != nil {
+		shell.Debugf("azure: inspect VM state after SSH connectivity failure: %v", err)
+		return false, nil
+	}
+	transitioned := state == provider.StateStopping || state == provider.StateStarting
+	if transitioned {
+		state, err = p.waitForStoppedOrRunning(ctx)
+		if err != nil {
+			return false, err
+		}
+	}
+	if state != provider.StateStopped && !(transitioned && state == provider.StateRunning) {
+		return false, nil
+	}
+
+	if state == provider.StateStopped {
+		shell.Debugf("azure: VM stopped during SSH setup; starting it again")
+	} else {
+		shell.Debugf("azure: VM changed state during SSH setup; reacquiring startup guard")
+	}
+	if _, err := p.EnsureInstance(ctx); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (p *Provider) waitForStoppedOrRunning(ctx context.Context) (provider.InstanceState, error) {
+	deadline := time.Now().Add(10 * time.Minute)
+	for {
+		state, err := p.State(ctx)
+		if err != nil {
+			return provider.StateUnknown, err
+		}
+		if state == provider.StateStopped || state == provider.StateRunning {
+			return state, nil
+		}
+		if time.Now().After(deadline) {
+			return state, fmt.Errorf("timed out waiting for VM stop transition (current: %s)", state)
+		}
+		select {
+		case <-ctx.Done():
+			return provider.StateUnknown, ctx.Err()
 		case <-time.After(5 * time.Second):
 		}
 	}
@@ -908,6 +1043,10 @@ func isSSHStartupError(err error) bool {
 		strings.Contains(msg, "permission denied (publickey)") ||
 		strings.Contains(msg, "unable to authenticate") ||
 		strings.Contains(msg, "eof")
+}
+
+func isSSHConnectivityError(err error) bool {
+	return isSSHStartupError(err) && !sshrun.IsAuthenticationError(err)
 }
 
 func retrySSHReady(ctx context.Context, operation string, fn func() error) error {

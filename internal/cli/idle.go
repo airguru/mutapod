@@ -147,6 +147,10 @@ func maybeConfigureIdleLease(ctx context.Context, cfg *config.Config, prov provi
 		if err := idle.EnableTimer(ctx, prov); err != nil {
 			return nil, fmt.Errorf("idle: enable timer: %w", err)
 		}
+	} else {
+		if err := idle.DisableTimer(ctx, prov); err != nil {
+			return nil, fmt.Errorf("idle: disable timer: %w", err)
+		}
 	}
 	refresher := startInProcessIdleLeaseRefresher(ctx, cfg, sshClient, hostID, opts)
 	if cfg.Idle.IsEnabled() {
