@@ -30,30 +30,43 @@ var skippedAutoUpdateCommands = map[string]bool{
 	"completion":     true,
 }
 
-func maybeCheckForUpdate(cmd *cobra.Command) {
+type updatedCommandCompletedError struct {
+	exitCode int
+}
+
+func (e *updatedCommandCompletedError) Error() string {
+	return "updated mutapod command completed"
+}
+
+func maybeCheckForUpdate(cmd *cobra.Command) error {
 	if cmd == nil || skippedAutoUpdateCommands[cmd.Name()] {
 		if cmd != nil {
 			shell.Debugf("update: skipping automatic check for command %q", cmd.Name())
 		}
-		return
+		return nil
 	}
 	if !isReleaseBuild() {
 		shell.Debugf("update: skipping automatic check for non-release build %q", buildinfo.DisplayVersion())
-		return
+		return nil
+	}
+	if os.Getenv(update.ResumedEnvironmentVariable) == "1" {
+		_ = os.Unsetenv(update.ResumedEnvironmentVariable)
+		shell.Debugf("update: skipping automatic check for command resumed after update")
+		return nil
 	}
 	if os.Getenv("MUTAPOD_SKIP_UPDATE_CHECK") == "1" {
 		shell.Debugf("update: skipping automatic check because MUTAPOD_SKIP_UPDATE_CHECK=1")
-		return
+		return nil
 	}
 	if !isTerminal(os.Stdin) || !isTerminal(os.Stdout) {
 		shell.Debugf("update: skipping automatic check because stdin/stdout is not an interactive terminal")
-		return
+		return nil
 	}
 
 	updater, err := update.New()
 	if err != nil {
 		shell.Debugf("update: skipping automatic check: %v", err)
-		return
+		return nil
 	}
 
 	shell.Debugf("update: checking GitHub releases for updates from %s", buildinfo.DisplayVersion())
@@ -62,54 +75,69 @@ func maybeCheckForUpdate(cmd *cobra.Command) {
 	status, err := updater.Check(checkCtx, buildinfo.DisplayVersion())
 	if err != nil {
 		shell.Debugf("update: automatic check failed: %v", err)
-		return
+		return nil
 	}
 	if status.UpToDate {
 		shell.Debugf("update: current version %s is up to date (latest: %s)", buildinfo.DisplayVersion(), status.Latest.TagName)
-		return
+		return nil
 	}
 	shell.Debugf("update: newer version available: %s", status.Latest.TagName)
 
 	current := displayCurrentVersion(status)
 	fmt.Printf("A new mutapod version is available: %s (current: %s)\n", status.Latest.TagName, current)
-	fmt.Printf("Update now? [y/N] (continuing in %ds if no response): ", int(autoUpdatePromptTimeout.Seconds()))
+	fmt.Printf("Update now? [Y/n] (updating automatically in %ds): ", int(autoUpdatePromptTimeout.Seconds()))
 
 	answer, got := readLineWithTimeout(os.Stdin, autoUpdatePromptTimeout)
 	if !got {
 		fmt.Println()
-		fmt.Println("No response — continuing with current version.")
-		return
-	}
-	answer = strings.ToLower(strings.TrimSpace(answer))
-	if answer != "y" && answer != "yes" {
-		return
+		fmt.Println("No response — updating automatically.")
+	} else if !shouldInstallUpdate(answer) {
+		fmt.Println("Continuing with current version.")
+		return nil
 	}
 
 	fmt.Println("Downloading update...")
 	dctx, dcancel := context.WithTimeout(context.Background(), autoUpdateDownloadTimeout)
 	defer dcancel()
-	result, err := updater.Update(dctx, buildinfo.DisplayVersion())
+	result, err := updater.UpdateForRelaunch(dctx, buildinfo.DisplayVersion())
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Update failed: %v\n", err)
 		fmt.Fprintln(os.Stderr, "Continuing with current version.")
-		return
+		return nil
 	}
 	if !result.Updated {
-		return
+		return nil
 	}
 
 	fmt.Printf("Updated mutapod to %s.\n", result.Release.TagName)
 
+	if result.RelaunchPath == "" {
+		return fmt.Errorf("update: no executable was prepared for relaunch")
+	}
 	if result.PendingRestart {
-		fmt.Println("The new version will be used the next time you run mutapod. Continuing with current version...")
-		return
+		fmt.Println("Restarting this command with the new version...")
+	} else {
+		fmt.Println("Relaunching with new version...")
 	}
 
-	fmt.Println("Relaunching with new version...")
-	if err := relaunch(result.ExecutablePath); err != nil {
-		fmt.Fprintf(os.Stderr, "Relaunch failed: %v\n", err)
-		fmt.Fprintln(os.Stderr, "Please re-run the command to use the new version.")
-		os.Exit(0)
+	if err := os.Setenv(update.ResumedEnvironmentVariable, "1"); err != nil {
+		return fmt.Errorf("update: mark command for relaunch: %w", err)
+	}
+	exitCode, err := relaunch(result.RelaunchPath, os.Args[1:])
+	_ = os.Unsetenv(update.ResumedEnvironmentVariable)
+	if err != nil {
+		return fmt.Errorf("update: relaunch updated command: %w", err)
+	}
+	cmd.Root().SilenceErrors = true
+	return &updatedCommandCompletedError{exitCode: exitCode}
+}
+
+func shouldInstallUpdate(answer string) bool {
+	switch strings.ToLower(strings.TrimSpace(answer)) {
+	case "", "y", "yes":
+		return true
+	default:
+		return false
 	}
 }
 

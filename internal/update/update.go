@@ -30,9 +30,16 @@ const (
 )
 
 var startDetachedWindowsReplace = func(scriptPath string) error {
-	cmd := exec.Command("cmd.exe", "/C", "start", "", "/B", scriptPath)
+	cmd := exec.Command("cmd.exe", "/C", scriptPath)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
 	return cmd.Start()
 }
+
+// ResumedEnvironmentVariable suppresses the redundant update check in the
+// freshly installed process. It is removed before the command runs.
+const ResumedEnvironmentVariable = "MUTAPOD_UPDATE_RESUMED"
 
 type Updater struct {
 	HTTPClient     *http.Client
@@ -64,6 +71,7 @@ type Result struct {
 	Updated        bool
 	PendingRestart bool
 	ExecutablePath string
+	RelaunchPath   string
 }
 
 type githubRelease struct {
@@ -115,6 +123,18 @@ func (u *Updater) Check(ctx context.Context, currentVersion string) (*Status, er
 }
 
 func (u *Updater) Update(ctx context.Context, currentVersion string) (*Result, error) {
+	return u.update(ctx, currentVersion, false)
+}
+
+// UpdateForRelaunch installs the latest release and returns an executable path
+// from which the caller can immediately run the original command. On Windows
+// this is the staged new binary because the running binary cannot be replaced
+// until the current process exits.
+func (u *Updater) UpdateForRelaunch(ctx context.Context, currentVersion string) (*Result, error) {
+	return u.update(ctx, currentVersion, true)
+}
+
+func (u *Updater) update(ctx context.Context, currentVersion string, prepareRelaunch bool) (*Result, error) {
 	status, err := u.Check(ctx, currentVersion)
 	if err != nil {
 		return nil, err
@@ -152,9 +172,16 @@ func (u *Updater) Update(ctx context.Context, currentVersion string) (*Result, e
 	}
 	defer cleanup()
 
-	pendingRestart, err := installBinary(binaryPath, u.ExecutablePath, u.GOOS)
+	pendingRestart, stagedPath, err := installBinary(binaryPath, u.ExecutablePath, u.GOOS)
 	if err != nil {
 		return nil, err
+	}
+	relaunchPath := ""
+	if prepareRelaunch {
+		relaunchPath = u.ExecutablePath
+		if pendingRestart {
+			relaunchPath = stagedPath
+		}
 	}
 
 	return &Result{
@@ -162,6 +189,7 @@ func (u *Updater) Update(ctx context.Context, currentVersion string) (*Result, e
 		Updated:        true,
 		PendingRestart: pendingRestart,
 		ExecutablePath: u.ExecutablePath,
+		RelaunchPath:   relaunchPath,
 	}, nil
 }
 
@@ -464,11 +492,12 @@ func writeExecutable(path string, src io.Reader, mode os.FileMode) error {
 	return nil
 }
 
-func installBinary(srcPath, targetPath, goos string) (bool, error) {
+func installBinary(srcPath, targetPath, goos string) (bool, string, error) {
 	if goos == "windows" {
-		return true, stageWindowsReplacement(srcPath, targetPath)
+		stagedPath, err := stageWindowsReplacement(srcPath, targetPath)
+		return true, stagedPath, err
 	}
-	return false, replaceExecutable(srcPath, targetPath)
+	return false, "", replaceExecutable(srcPath, targetPath)
 }
 
 func replaceExecutable(srcPath, targetPath string) error {
@@ -488,23 +517,23 @@ func replaceExecutable(srcPath, targetPath string) error {
 	return nil
 }
 
-func stageWindowsReplacement(srcPath, targetPath string) error {
+func stageWindowsReplacement(srcPath, targetPath string) (string, error) {
 	stagedPath := filepath.Join(filepath.Dir(targetPath), fmt.Sprintf(".%s.%d.new", filepath.Base(targetPath), time.Now().UnixNano()))
 	if err := copyFile(srcPath, stagedPath, 0755); err != nil {
-		return err
+		return "", err
 	}
 
 	scriptPath, err := writeWindowsReplaceScript(stagedPath, targetPath)
 	if err != nil {
 		_ = os.Remove(stagedPath)
-		return err
+		return "", err
 	}
 	if err := startDetachedWindowsReplace(scriptPath); err != nil {
 		_ = os.Remove(stagedPath)
 		_ = os.Remove(scriptPath)
-		return fmt.Errorf("update: launch Windows replace helper: %w", err)
+		return "", fmt.Errorf("update: launch Windows replace helper: %w", err)
 	}
-	return nil
+	return stagedPath, nil
 }
 
 func writeWindowsReplaceScript(sourcePath, targetPath string) (string, error) {

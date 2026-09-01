@@ -7,6 +7,7 @@ import (
 	"syscall"
 )
 
-func relaunch(path string) error {
-	return syscall.Exec(path, os.Args, os.Environ())
+func relaunch(path string, args []string) (int, error) {
+	argv := append([]string{path}, args...)
+	return 1, syscall.Exec(path, argv, os.Environ())
 }

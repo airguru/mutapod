@@ -45,6 +45,7 @@ GCP and Azure are supported providers today.
 
 Mutagen is downloaded automatically into `~/.mutapod/bin` if it is not already available on `PATH`.
 mutapod itself can be updated explicitly with `mutapod update`.
+For interactive commands, an available update is installed automatically after the 30-second prompt timeout and the original command resumes on the new binary; enter `n` to skip it for that run.
 
 ## Example `mutapod.yaml`
 

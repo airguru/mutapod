@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"errors"
 	"os"
 
 	"github.com/spf13/cobra"
@@ -24,9 +25,9 @@ func Root() *cobra.Command {
 to it via Mutagen, starts a devcontainer, and forwards ports — all with one command.`,
 		SilenceUsage: true,
 		Version:      buildinfo.DisplayVersion(),
-		PersistentPreRun: func(cmd *cobra.Command, args []string) {
+		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 			shell.SetDebug(debug)
-			maybeCheckForUpdate(cmd)
+			return maybeCheckForUpdate(cmd)
 		},
 	}
 
@@ -52,6 +53,13 @@ to it via Mutagen, starts a devcontainer, and forwards ports — all with one co
 // Execute runs the root command.
 func Execute() {
 	if err := Root().Execute(); err != nil {
+		var completed *updatedCommandCompletedError
+		if errors.As(err, &completed) {
+			if completed.exitCode != 0 {
+				os.Exit(completed.exitCode)
+			}
+			return
+		}
 		os.Exit(1)
 	}
 }

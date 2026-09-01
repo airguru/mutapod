@@ -327,7 +327,10 @@ func TestSSHConfigRepairsRejectedManagedKey(t *testing.T) {
 		t.Fatalf("SSH probe attempts: got %d, want 2", attempts)
 	}
 
-	wantKey := base64.StdEncoding.EncodeToString([]byte(identity.PublicKey))
+	wantKey := base64.RawStdEncoding.EncodeToString([]byte(identity.PublicKey))
+	if strings.Contains(wantKey, "=") {
+		t.Fatalf("Azure Run Command transport must not contain '=': %q", wantKey)
+	}
 	if !f.CalledWith("az",
 		"vm", "run-command", "invoke",
 		"--resource-group", "rg-dev",
@@ -572,31 +575,42 @@ func TestAuthorizedKeysScriptPreservesUnrelatedKeysAndIsIdempotent(t *testing.T)
 	writeExecutable(t, filepath.Join(bin, "install"), "#!/bin/sh\nfor arg do target=\"$arg\"; done\nmkdir -p \"$target\"\nchmod 700 \"$target\"\n")
 
 	publicKey := "ssh-ed25519 AAAAcurrent"
-	encoded := base64.StdEncoding.EncodeToString([]byte(publicKey))
+	encoded := base64.RawStdEncoding.EncodeToString([]byte(publicKey))
+	if strings.Contains(encoded, "=") {
+		t.Fatalf("test transport unexpectedly contains padding: %q", encoded)
+	}
 	scriptPath := filepath.Join("scripts", "ensure_authorized_key.sh")
 	absoluteScriptPath, err := filepath.Abs(scriptPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for run := 0; run < 2; run++ {
+	runScript := func(encodedKey, keyMarker string) ([]byte, error) {
 		command := "PATH=" + shellTestQuote(bashPath(bash, bin)+":/usr/bin:/bin") +
 			"; export PATH; MUTAPOD_TEST_HOME=" + shellTestQuote(bashPath(bash, home)) +
 			"; export MUTAPOD_TEST_HOME; " + shellTestQuote(bashPath(bash, absoluteScriptPath)) +
-			" test " + shellTestQuote(encoded) + " " + shellTestQuote(marker)
+			" test " + shellTestQuote(encodedKey) + " " + shellTestQuote(keyMarker)
 		args := []string{"-c", command}
 		executable := bash
 		if isWSLBash(bash) {
 			wsl, err := exec.LookPath("wsl")
 			if err != nil {
-				t.Skip("WSL launcher is not available")
+				return nil, err
 			}
 			executable = wsl
 			args = append([]string{"--", "bash"}, args...)
 		}
 		cmd := exec.Command(executable, args...)
-		if output, err := cmd.CombinedOutput(); err != nil {
+		return cmd.CombinedOutput()
+	}
+	for run := 0; run < 2; run++ {
+		if output, err := runScript(encoded, marker); err != nil {
 			t.Fatalf("run authorized_keys script: %v\n%s", err, output)
 		}
+	}
+	if output, err := runScript("", marker); err == nil {
+		t.Fatalf("empty public key transport unexpectedly succeeded:\n%s", output)
+	} else if !strings.Contains(string(output), "empty or invalid") {
+		t.Fatalf("unexpected empty-key failure: %v\n%s", err, output)
 	}
 
 	data, err := os.ReadFile(authorizedKeys)

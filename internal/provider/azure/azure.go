@@ -393,7 +393,10 @@ func (p *Provider) ensureSSHAuthentication(ctx context.Context, client *sshrun.C
 
 func (p *Provider) repairSSHAccess(ctx context.Context, identity *sshIdentity) error {
 	az := p.cfg.Provider.Azure
-	publicKeyB64 := base64.StdEncoding.EncodeToString([]byte(identity.PublicKey))
+	// Azure CLI parses positional --parameters values containing "=" as
+	// name=value pairs. Use unpadded Base64 so the public key remains the
+	// script's second positional argument.
+	publicKeyB64 := base64.RawStdEncoding.EncodeToString([]byte(identity.PublicKey))
 	args := []string{
 		"vm", "run-command", "invoke",
 		"--resource-group", az.ResourceGroup,

@@ -101,7 +101,7 @@ func TestUpdateReplacesExecutableOnUnix(t *testing.T) {
 		ExecutablePath: target,
 	}
 
-	result, err := updater.Update(context.Background(), "1.2.2")
+	result, err := updater.UpdateForRelaunch(context.Background(), "1.2.2")
 	if err != nil {
 		t.Fatalf("Update: %v", err)
 	}
@@ -110,6 +110,9 @@ func TestUpdateReplacesExecutableOnUnix(t *testing.T) {
 	}
 	if result.PendingRestart {
 		t.Fatal("expected direct replacement on unix")
+	}
+	if result.RelaunchPath != target {
+		t.Fatalf("Unix relaunch path: got %q, want %q", result.RelaunchPath, target)
 	}
 
 	data, err := os.ReadFile(target)
@@ -171,12 +174,15 @@ func TestUpdateStagesWindowsReplacement(t *testing.T) {
 		ExecutablePath: target,
 	}
 
-	result, err := updater.Update(context.Background(), "1.2.2")
+	result, err := updater.UpdateForRelaunch(context.Background(), "1.2.2")
 	if err != nil {
 		t.Fatalf("Update: %v", err)
 	}
 	if !result.PendingRestart {
 		t.Fatal("expected Windows update to be staged for restart")
+	}
+	if result.RelaunchPath == "" {
+		t.Fatal("expected staged Windows binary to be available for immediate relaunch")
 	}
 	if launchedScript == "" {
 		t.Fatal("expected Windows helper script to be launched")
@@ -200,6 +206,16 @@ func TestUpdateStagesWindowsReplacement(t *testing.T) {
 	}
 	if len(matches) != 1 {
 		t.Fatalf("expected one staged binary, got %d", len(matches))
+	}
+	if result.RelaunchPath != matches[0] {
+		t.Fatalf("relaunch path: got %q, want %q", result.RelaunchPath, matches[0])
+	}
+	stagedData, err := os.ReadFile(result.RelaunchPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(stagedData) != "new windows binary" {
+		t.Fatalf("unexpected staged binary contents: %q", stagedData)
 	}
 }
 
