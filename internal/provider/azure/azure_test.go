@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
@@ -223,8 +224,8 @@ func TestEnsureInstanceRestartsVMThatWasStopping(t *testing.T) {
 			default:
 				return []byte("VM running\n"), nil
 			}
-		case name == "az" && strings.Contains(joined, "--scripts "+azureStartupGuardScript):
-			return []byte("mutapod:startup-guard-active:restart\n"), nil
+		case name == "az" && strings.Contains(joined, "--scripts "+azureRunShellWrapper(azureStartupGuardScript)):
+			return []byte(azureRunCommandFixture("mutapod:startup-guard-active:restart\n")), nil
 		default:
 			return nil, nil
 		}
@@ -361,15 +362,14 @@ func TestSSHConfigRepairsRejectedManagedKey(t *testing.T) {
 	}
 	keySum := sha256.Sum256([]byte(identity.PublicKey))
 	confirmation := "mutapod:ssh-key-installed:" + identity.Marker + ":" + hex.EncodeToString(keySum[:]) + ":1\n"
-	f.Stub(confirmation, "az",
+	f.Stub(azureRunCommandFixture(confirmation), "az",
 		"vm", "run-command", "invoke",
 		"--resource-group", "rg-dev",
 		"--name", instanceName,
 		"--command-id", "RunShellScript",
-		"--scripts", azureAuthorizedKeysScript,
+		"--scripts", azureRunShellWrapper(azureAuthorizedKeysScript),
 		"--parameters", "azureuser", base64.RawStdEncoding.EncodeToString([]byte(identity.PublicKey)), identity.Marker,
-		"--query", "value[0].message",
-		"--output", "tsv",
+		"--output", "json",
 		"--subscription", "sub-123",
 	)
 	if _, err := p.SSHConfig(context.Background()); err != nil {
@@ -388,10 +388,9 @@ func TestSSHConfigRepairsRejectedManagedKey(t *testing.T) {
 		"--resource-group", "rg-dev",
 		"--name", instanceName,
 		"--command-id", "RunShellScript",
-		"--scripts", azureAuthorizedKeysScript,
+		"--scripts", azureRunShellWrapper(azureAuthorizedKeysScript),
 		"--parameters", "azureuser", wantKey, identity.Marker,
-		"--query", "value[0].message",
-		"--output", "tsv",
+		"--output", "json",
 		"--subscription", "sub-123",
 	) {
 		t.Fatalf("expected Azure Run Command key repair, got %#v", f.Calls)
@@ -435,9 +434,9 @@ func TestSSHConfigResetsDeadlineAfterSlowKeyRepair(t *testing.T) {
 		switch {
 		case name == "az" && strings.Contains(joined, "--query privateIps"):
 			return []byte("10.1.2.3\n"), nil
-		case name == "az" && strings.Contains(joined, "--scripts "+azureAuthorizedKeysScript):
+		case name == "az" && strings.Contains(joined, "--scripts "+azureRunShellWrapper(azureAuthorizedKeysScript)):
 			time.Sleep(35 * time.Millisecond)
-			return []byte(confirmation), nil
+			return []byte(azureRunCommandFixture(confirmation)), nil
 		case name == "az" && strings.Contains(joined, "--query powerState"):
 			return []byte("VM running\n"), nil
 		default:
@@ -483,16 +482,16 @@ func TestSSHConfigRestartsVMStoppedDuringKeyVerification(t *testing.T) {
 		switch {
 		case name == "az" && strings.Contains(joined, "--query privateIps"):
 			return []byte("10.1.2.3\n"), nil
-		case name == "az" && strings.Contains(joined, "--scripts "+azureAuthorizedKeysScript):
-			return []byte(confirmation), nil
+		case name == "az" && strings.Contains(joined, "--scripts "+azureRunShellWrapper(azureAuthorizedKeysScript)):
+			return []byte(azureRunCommandFixture(confirmation)), nil
 		case name == "az" && strings.Contains(joined, "--query powerState"):
 			powerStateCalls++
 			if powerStateCalls <= 2 {
 				return []byte("VM stopped\n"), nil
 			}
 			return []byte("VM running\n"), nil
-		case name == "az" && strings.Contains(joined, "--scripts "+azureStartupGuardScript):
-			return []byte("mutapod:startup-guard-active:restart\n"), nil
+		case name == "az" && strings.Contains(joined, "--scripts "+azureRunShellWrapper(azureStartupGuardScript)):
+			return []byte(azureRunCommandFixture("mutapod:startup-guard-active:restart\n")), nil
 		default:
 			return nil, nil
 		}
@@ -511,13 +510,72 @@ func TestSSHConfigRestartsVMStoppedDuringKeyVerification(t *testing.T) {
 }
 
 func TestRepairSSHAccessRequiresGuestConfirmation(t *testing.T) {
+	useFastRunCommandRetries(t, 5*time.Millisecond)
 	p := New(testConfig(), shell.NewFakeCommander())
 	err := p.repairSSHAccess(context.Background(), &sshIdentity{
 		PublicKey: "ssh-ed25519 AAAAcurrent",
 		Marker:    "mutapod-test",
 	})
-	if err == nil || !strings.Contains(err.Error(), "did not confirm") {
+	if err == nil || !strings.Contains(err.Error(), "confirmation timed out") {
 		t.Fatalf("expected missing confirmation error, got %v", err)
+	}
+}
+
+func TestAzureRunShellWrapperIsSingleLineAndPreservesScript(t *testing.T) {
+	script := "set -eu\nprintf 'marker:%s\\n' \"$1\"\n"
+	wrapper := azureRunShellWrapper(script)
+	if strings.ContainsAny(wrapper, "\r\n") {
+		t.Fatalf("Windows --scripts argv must be one line: %q", wrapper)
+	}
+	parts := strings.Split(wrapper, "'")
+	if len(parts) < 4 {
+		t.Fatalf("unexpected wrapper: %q", wrapper)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(parts[3])
+	if err != nil {
+		t.Fatalf("decode wrapper script: %v", err)
+	}
+	if string(decoded) != script {
+		t.Fatalf("decoded script changed:\n got %q\nwant %q", decoded, script)
+	}
+}
+
+func TestRunCommandEmptySuccessFixtureIsRetriedThenConfirmed(t *testing.T) {
+	useFastRunCommandRetries(t, 100*time.Millisecond)
+	actualEmptySuccess := `{"value":[{"code":"ProvisioningState/succeeded","displayStatus":"Provisioning succeeded","level":"Info","message":"Enable succeeded: \n[stdout]\n\n[stderr]\n"}]}`
+	runAttempts := 0
+	cmd := &callbackCommander{output: func(_ context.Context, _ shell.RunOptions, _ string, args ...string) ([]byte, error) {
+		if strings.Contains(strings.Join(args, " "), "--query powerState") {
+			return []byte("VM running\n"), nil
+		}
+		runAttempts++
+		switch runAttempts {
+		case 1:
+			return []byte(actualEmptySuccess), nil
+		case 2:
+			return nil, errors.New("Conflict: Run command extension execution is in progress")
+		default:
+			return []byte(azureRunCommandFixture("mutapod:confirmed\n")), nil
+		}
+	}}
+	p := New(testConfig(), cmd)
+
+	if err := p.invokeRunShellWithConfirmation(context.Background(), "test operation", "printf marker", nil, "mutapod:confirmed"); err != nil {
+		t.Fatalf("invokeRunShellWithConfirmation: %v", err)
+	}
+	if runAttempts != 3 {
+		t.Fatalf("attempts: got %d, want 3", runAttempts)
+	}
+}
+
+func TestParseRunCommandResponsePreservesActualEmptySuccessDiagnostic(t *testing.T) {
+	fixture := []byte(`{"value":[{"code":"ProvisioningState/succeeded","displayStatus":"Provisioning succeeded","level":"Info","message":"Enable succeeded: \n[stdout]\n\n[stderr]\n"}]}`)
+	messages, diagnostic, err := parseAzureRunCommandResponse(fixture)
+	if err != nil {
+		t.Fatalf("parseAzureRunCommandResponse: %v", err)
+	}
+	if !strings.Contains(messages, "[stdout]") || !strings.Contains(diagnostic, "ProvisioningState/succeeded") {
+		t.Fatalf("actual Azure response was not preserved: messages=%q diagnostic=%q", messages, diagnostic)
 	}
 }
 
@@ -535,15 +593,14 @@ func TestEnsureStartupGuardUsesIdleMode(t *testing.T) {
 			cfg := testConfig()
 			cfg.Idle.Enabled = tt.enabled
 			f := shell.NewFakeCommander()
-			f.Stub("mutapod:startup-guard-active:"+tt.mode+"\n", "az",
+			f.Stub(azureRunCommandFixture("mutapod:startup-guard-active:"+tt.mode+"\n"), "az",
 				"vm", "run-command", "invoke",
 				"--resource-group", "rg-dev",
 				"--name", cfg.InstanceName(),
 				"--command-id", "RunShellScript",
-				"--scripts", azureStartupGuardScript,
+				"--scripts", azureRunShellWrapper(azureStartupGuardScript),
 				"--parameters", tt.mode,
-				"--query", "value[0].message",
-				"--output", "tsv",
+				"--output", "json",
 				"--subscription", "sub-123",
 			)
 			if err := New(cfg, f).ensureStartupGuard(context.Background()); err != nil {
@@ -995,6 +1052,36 @@ func isWSLBash(bash string) bool {
 
 func shellTestQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
+}
+
+func azureRunCommandFixture(message string) string {
+	payload := azureRunCommandResponse{}
+	payload.Value = append(payload.Value, struct {
+		Code          string `json:"code"`
+		DisplayStatus string `json:"displayStatus"`
+		Message       string `json:"message"`
+	}{
+		Code:          "ProvisioningState/succeeded",
+		DisplayStatus: "Provisioning succeeded",
+		Message:       message,
+	})
+	data, err := json.Marshal(payload)
+	if err != nil {
+		panic(err)
+	}
+	return string(data)
+}
+
+func useFastRunCommandRetries(t *testing.T, timeout time.Duration) {
+	t.Helper()
+	oldTimeout := runCommandTimeout
+	oldRetryPeriod := runCommandRetryPeriod
+	runCommandTimeout = timeout
+	runCommandRetryPeriod = time.Millisecond
+	t.Cleanup(func() {
+		runCommandTimeout = oldTimeout
+		runCommandRetryPeriod = oldRetryPeriod
+	})
 }
 
 type callbackCommander struct {

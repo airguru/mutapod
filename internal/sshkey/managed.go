@@ -87,7 +87,9 @@ func EnsureManaged(provider, target string) (*Pair, error) {
 	if err := os.WriteFile(publicPath, []byte(authorizedKey+"\n"), 0644); err != nil {
 		return nil, fmt.Errorf("sshkey: write public key: %w", err)
 	}
-	_ = os.Chmod(privatePath, 0600)
+	if err := securePrivateKey(privatePath); err != nil {
+		return nil, fmt.Errorf("sshkey: secure private key: %w", err)
+	}
 	_ = os.Chmod(publicPath, 0644)
 
 	return &Pair{

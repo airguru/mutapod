@@ -21,6 +21,13 @@ systemctl stop "$idle_timer"
 if [ "$mode" = "restart" ]; then
     guard_unit="mutapod-startup-guard-$(date +%s)-$$"
     systemd-run --quiet --unit="$guard_unit" --on-active=30m /bin/systemctl start "$idle_timer"
+    if ! systemctl is-active --quiet "$guard_unit.timer"; then
+        echo "mutapod: startup guard timer did not become active" >&2
+        exit 1
+    fi
+elif systemctl is-active --quiet "$idle_timer"; then
+    echo "mutapod: idle timer remained active" >&2
+    exit 1
 fi
 
 echo "mutapod:startup-guard-active:$mode"
