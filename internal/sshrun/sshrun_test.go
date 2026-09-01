@@ -1,6 +1,7 @@
 package sshrun
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/x509"
@@ -126,6 +127,46 @@ func TestTrustHostReplacesStaleAliasAndPreservesOtherHosts(t *testing.T) {
 	<-done
 }
 
+func TestProbeVerifiesAuthentication(t *testing.T) {
+	hostSigner := mustGenerateSigner(t)
+	identityFile := filepath.Join(t.TempDir(), "id_test")
+	clientSigner := writePrivateKeyFileWithSigner(t, identityFile)
+	serverConfig := &gossh.ServerConfig{
+		PublicKeyCallback: func(conn gossh.ConnMetadata, key gossh.PublicKey) (*gossh.Permissions, error) {
+			if string(key.Marshal()) != string(clientSigner.PublicKey().Marshal()) {
+				return nil, errors.New("wrong key")
+			}
+			return nil, nil
+		},
+	}
+	serverConfig.AddHostKey(hostSigner)
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		sshConn, _, _, err := gossh.NewServerConn(conn, serverConfig)
+		if err == nil {
+			_ = sshConn.Close()
+		}
+	}()
+
+	client := New("127.0.0.1", listener.Addr().(*net.TCPAddr).Port, "tester", identityFile)
+	if err := client.Probe(context.Background()); err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
+	<-done
+}
+
 func TestReplaceKnownHostAliasRecognizesMarkerAndHostLists(t *testing.T) {
 	existing := strings.Join([]string{
 		"@cert-authority vm-alias,other-host ssh-ed25519 old",
@@ -182,6 +223,16 @@ func TestIsTransientDialError(t *testing.T) {
 	}
 }
 
+func TestIsAuthenticationError(t *testing.T) {
+	err := errors.New("ssh: handshake failed: ssh: unable to authenticate, attempted methods [none publickey], no supported methods remain")
+	if !IsAuthenticationError(err) {
+		t.Fatalf("expected public-key rejection to be classified as authentication error")
+	}
+	if IsAuthenticationError(errors.New("dial tcp: connection refused")) {
+		t.Fatalf("connection failure must not be classified as authentication error")
+	}
+}
+
 func mustGenerateSigner(t *testing.T) gossh.Signer {
 	t.Helper()
 
@@ -198,6 +249,11 @@ func mustGenerateSigner(t *testing.T) gossh.Signer {
 
 func writePrivateKeyFile(t *testing.T, path string) {
 	t.Helper()
+	_ = writePrivateKeyFileWithSigner(t, path)
+}
+
+func writePrivateKeyFileWithSigner(t *testing.T, path string) gossh.Signer {
+	t.Helper()
 
 	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -211,4 +267,9 @@ func writePrivateKeyFile(t *testing.T, path string) {
 	if err := os.WriteFile(path, pem.EncodeToMemory(block), 0600); err != nil {
 		t.Fatalf("write client key: %v", err)
 	}
+	signer, err := gossh.NewSignerFromKey(privateKey)
+	if err != nil {
+		t.Fatalf("new client signer: %v", err)
+	}
+	return signer
 }

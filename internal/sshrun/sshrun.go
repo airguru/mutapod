@@ -54,6 +54,26 @@ func (c *Client) dial() (*gossh.Client, error) {
 	return gossh.Dial("tcp", addr, cfg)
 }
 
+// Probe verifies that the configured identity can authenticate. It does not
+// start a remote command or apply the normal transient-dial retry loop.
+func (c *Client) Probe(ctx context.Context) error {
+	done := make(chan error, 1)
+	go func() {
+		conn, err := c.dial()
+		if err == nil {
+			_ = conn.Close()
+		}
+		done <- err
+	}()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-done:
+		return err
+	}
+}
+
 // Run executes a shell command on the remote host.
 func (c *Client) Run(ctx context.Context, cmd string, stdin io.Reader, stdout, stderr io.Writer) error {
 	conn, err := c.dialWithRetry(ctx)
@@ -133,9 +153,20 @@ func isTransientDialError(err error) bool {
 		strings.Contains(msg, "network is unreachable") ||
 		strings.Contains(msg, "i/o timeout") ||
 		strings.Contains(msg, "operation timed out") ||
-		strings.Contains(msg, "permission denied (publickey)") ||
-		strings.Contains(msg, "unable to authenticate") ||
+		IsAuthenticationError(err) ||
 		strings.Contains(msg, "eof")
+}
+
+// IsAuthenticationError reports whether SSH reached the server but the
+// configured user identity was rejected.
+func IsAuthenticationError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "permission denied (publickey)") ||
+		strings.Contains(msg, "unable to authenticate") ||
+		strings.Contains(msg, "no supported methods remain")
 }
 
 // TrustHost scans the remote server's host key and stores it in knownHostsFile

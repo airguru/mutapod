@@ -3,6 +3,10 @@ package azure
 
 import (
 	"context"
+	"crypto/sha256"
+	_ "embed"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -15,16 +19,24 @@ import (
 	"github.com/mutapod/mutapod/internal/config"
 	"github.com/mutapod/mutapod/internal/provider"
 	"github.com/mutapod/mutapod/internal/shell"
+	"github.com/mutapod/mutapod/internal/sshkey"
 	"github.com/mutapod/mutapod/internal/sshrun"
+	gossh "golang.org/x/crypto/ssh"
 )
 
 var (
 	trustHostFunc = func(client *sshrun.Client, knownHostsFile, hostKeyAlias string) error {
 		return client.TrustHost(knownHostsFile, hostKeyAlias)
 	}
+	probeSSHFunc = func(ctx context.Context, client *sshrun.Client) error {
+		return client.Probe(ctx)
+	}
 	sshReadyTimeout     = 5 * time.Minute
 	sshReadyRetryPeriod = 2 * time.Second
 )
+
+//go:embed scripts/ensure_authorized_key.sh
+var azureAuthorizedKeysScript string
 
 func init() {
 	provider.Register("azure", func(cfg *config.Config, cmd shell.Commander) (provider.Provider, error) {
@@ -147,11 +159,7 @@ func (p *Provider) createVM(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	identityFile, err := p.identityFile()
-	if err != nil {
-		return err
-	}
-	publicKeyArg, err := p.publicKeyArg(identityFile)
+	identity, err := p.sshIdentity(ctx)
 	if err != nil {
 		return err
 	}
@@ -183,11 +191,7 @@ func (p *Provider) createVM(ctx context.Context) error {
 	if az.Location != "" {
 		args = append(args, "--location", az.Location)
 	}
-	if publicKeyArg != "" {
-		args = append(args, "--ssh-key-values", publicKeyArg)
-	} else {
-		args = append(args, "--generate-ssh-keys")
-	}
+	args = append(args, "--ssh-key-values", "@"+identity.PublicPath)
 	if az.VNet != "" {
 		args = append(args, "--vnet-name", az.VNet)
 	}
@@ -303,7 +307,7 @@ func (p *Provider) waitForRunning(ctx context.Context) (provider.InstanceState, 
 // SSHConfig writes an OpenSSH config alias for Mutagen and returns connection params.
 func (p *Provider) SSHConfig(ctx context.Context) (*provider.SSHConfig, error) {
 	az := p.cfg.Provider.Azure
-	identityFile, err := p.identityFile()
+	identity, err := p.sshIdentity(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -324,30 +328,112 @@ func (p *Provider) SSHConfig(ctx context.Context) (*provider.SSHConfig, error) {
 		HostName:       ip,
 		User:           az.AdminUsername,
 		Port:           22,
-		IdentityFile:   identityFile,
+		IdentityFile:   identity.PrivatePath,
 		KnownHostsFile: knownHostsFile,
 		HostKeyAlias:   host,
 	}); err != nil {
 		return nil, err
 	}
 
-	client := sshrun.New(ip, 22, az.AdminUsername, identityFile)
+	client := sshrun.New(ip, 22, az.AdminUsername, identity.PrivatePath)
 	if err := retrySSHReady(ctx, "trust host key", func() error {
 		return trustHostFunc(client, knownHostsFile, host)
 	}); err != nil {
 		return nil, fmt.Errorf("azure: trust host key: %w", err)
 	}
 	shell.Debugf("azure: host key trusted in %s for alias %s", knownHostsFile, host)
+	if err := p.ensureSSHAuthentication(ctx, client, identity); err != nil {
+		return nil, err
+	}
+	shell.Debugf("azure: SSH authentication verified for %s", host)
 
 	cfg := &provider.SSHConfig{
 		Host:         host,
 		IP:           ip,
 		Port:         22,
 		User:         az.AdminUsername,
-		IdentityFile: identityFile,
+		IdentityFile: identity.PrivatePath,
 	}
 	p.sshCfg = cfg
 	return cfg, nil
+}
+
+func (p *Provider) ensureSSHAuthentication(ctx context.Context, client *sshrun.Client, identity *sshIdentity) error {
+	repaired := false
+	deadline := time.Now().Add(sshReadyTimeout)
+	for {
+		err := probeSSHFunc(ctx, client)
+		if err == nil {
+			return nil
+		}
+
+		if sshrun.IsAuthenticationError(err) && !repaired {
+			shell.Debugf("azure: SSH key rejected; reconciling managed access through Azure Run Command")
+			if repairErr := p.repairSSHAccess(ctx, identity); repairErr != nil {
+				return fmt.Errorf("azure: repair SSH access after key rejection: %w", repairErr)
+			}
+			repaired = true
+			continue
+		}
+		if !isSSHStartupError(err) || time.Now().After(deadline) {
+			if repaired {
+				return fmt.Errorf("azure: verify SSH access after key repair: %w", err)
+			}
+			return fmt.Errorf("azure: verify SSH access: %w", err)
+		}
+
+		shell.Debugf("azure: waiting for SSH authentication to become ready: %v", err)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(sshReadyRetryPeriod):
+		}
+	}
+}
+
+func (p *Provider) repairSSHAccess(ctx context.Context, identity *sshIdentity) error {
+	az := p.cfg.Provider.Azure
+	publicKeyB64 := base64.StdEncoding.EncodeToString([]byte(identity.PublicKey))
+	args := []string{
+		"vm", "run-command", "invoke",
+		"--resource-group", az.ResourceGroup,
+		"--name", p.name,
+		"--command-id", "RunShellScript",
+		"--scripts", azureAuthorizedKeysScript,
+		"--parameters", az.AdminUsername, publicKeyB64, identity.Marker,
+		"--output", "none",
+	}
+	args = p.withSubscription(args)
+
+	deadline := time.Now().Add(sshReadyTimeout)
+	for {
+		err := p.cmd.Run(ctx, shell.RunOptions{}, "az", args...)
+		if err == nil {
+			return nil
+		}
+		if !isRunCommandRetryable(err) || time.Now().After(deadline) {
+			return err
+		}
+		shell.Debugf("azure: waiting to reconcile SSH key through Run Command: %v", err)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(5 * time.Second):
+		}
+	}
+}
+
+func isRunCommandRetryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "run command extension execution is in progress") ||
+		strings.Contains(msg, "another operation is in progress") ||
+		strings.Contains(msg, "operation in progress") ||
+		strings.Contains(msg, "vm agent is not ready") ||
+		strings.Contains(msg, "retryableerror") ||
+		strings.Contains(msg, "conflict")
 }
 
 func (p *Provider) sshIP(ctx context.Context) (string, error) {
@@ -402,7 +488,7 @@ func firstIP(raw string) string {
 func (p *Provider) Exec(ctx context.Context, cmd []string, opts provider.ExecOptions) error {
 	if opts.Tty {
 		az := p.cfg.Provider.Azure
-		identityFile, err := p.identityFile()
+		identity, err := p.sshIdentity(ctx)
 		if err != nil {
 			return err
 		}
@@ -411,7 +497,7 @@ func (p *Provider) Exec(ctx context.Context, cmd []string, opts provider.ExecOpt
 			"--resource-group", az.ResourceGroup,
 			"--name", p.name,
 			"--local-user", az.AdminUsername,
-			"--private-key-file", identityFile,
+			"--private-key-file", identity.PrivatePath,
 		}
 		args = p.withSubscription(args)
 		if len(cmd) > 0 {
@@ -570,48 +656,107 @@ func (p *Provider) nsgName() string {
 	return p.name + "NSG"
 }
 
-func (p *Provider) identityFile() (string, error) {
-	az := p.cfg.Provider.Azure
-	if az.SSHPrivateKeyFile != "" {
-		return expandUserPath(az.SSHPrivateKeyFile)
-	}
-	if az.SSHPublicKeyFile != "" {
-		publicKeyFile, err := expandUserPath(az.SSHPublicKeyFile)
-		if err != nil {
-			return "", err
-		}
-		if strings.EqualFold(filepath.Ext(publicKeyFile), ".pub") {
-			return strings.TrimSuffix(publicKeyFile, filepath.Ext(publicKeyFile)), nil
-		}
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("azure: home dir: %w", err)
-	}
-	return filepath.Join(home, ".ssh", "id_rsa"), nil
+type sshIdentity struct {
+	PrivatePath string
+	PublicPath  string
+	PublicKey   string
+	Marker      string
 }
 
-func (p *Provider) publicKeyArg(identityFile string) (string, error) {
+func (p *Provider) sshIdentity(ctx context.Context) (*sshIdentity, error) {
 	az := p.cfg.Provider.Azure
-	if az.SSHPublicKeyFile != "" {
-		publicKeyFile, err := expandUserPath(az.SSHPublicKeyFile)
+	if az.SSHPrivateKeyFile == "" && az.SSHPublicKeyFile == "" {
+		target, err := p.InstanceID(ctx)
 		if err != nil {
-			return "", err
+			return nil, err
 		}
-		return "@" + publicKeyFile, nil
+		pair, err := sshkey.EnsureManaged("azure", target)
+		if err != nil {
+			return nil, fmt.Errorf("azure: ensure managed SSH key: %w", err)
+		}
+		return &sshIdentity{
+			PrivatePath: pair.PrivatePath,
+			PublicPath:  pair.PublicPath,
+			PublicKey:   pair.PublicKey,
+			Marker:      pair.Marker,
+		}, nil
 	}
+
+	privatePath := ""
 	if az.SSHPrivateKeyFile != "" {
-		publicKeyFile := identityFile + ".pub"
-		if _, err := os.Stat(publicKeyFile); err != nil {
-			return "", fmt.Errorf("azure: provider.azure.ssh_public_key_file is required when ssh_private_key_file is set and %q does not exist", publicKeyFile)
+		var err error
+		privatePath, err = expandUserPath(az.SSHPrivateKeyFile)
+		if err != nil {
+			return nil, err
 		}
-		return "@" + publicKeyFile, nil
 	}
-	publicKeyFile := identityFile + ".pub"
-	if _, err := os.Stat(publicKeyFile); err == nil {
-		return "@" + publicKeyFile, nil
+	publicPath := ""
+	if az.SSHPublicKeyFile != "" {
+		var err error
+		publicPath, err = expandUserPath(az.SSHPublicKeyFile)
+		if err != nil {
+			return nil, err
+		}
+		if privatePath == "" && strings.EqualFold(filepath.Ext(publicPath), ".pub") {
+			privatePath = strings.TrimSuffix(publicPath, filepath.Ext(publicPath))
+		}
 	}
-	return "", nil
+	if publicPath == "" {
+		publicPath = privatePath + ".pub"
+	}
+	if privatePath == "" {
+		return nil, fmt.Errorf("azure: could not derive private key path from provider.azure.ssh_public_key_file")
+	}
+	publicKey, err := readOrCreateCanonicalPublicKey(privatePath, publicPath)
+	if err != nil {
+		return nil, fmt.Errorf("azure: read SSH public key %q: %w", publicPath, err)
+	}
+	keySum := sha256.Sum256([]byte(publicKey))
+	return &sshIdentity{
+		PrivatePath: privatePath,
+		PublicPath:  publicPath,
+		PublicKey:   publicKey,
+		Marker:      "mutapod-explicit-" + hex.EncodeToString(keySum[:8]),
+	}, nil
+}
+
+func readCanonicalPublicKey(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	key, _, _, _, err := gossh.ParseAuthorizedKey(data)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(gossh.MarshalAuthorizedKey(key))), nil
+}
+
+func readOrCreateCanonicalPublicKey(privatePath, publicPath string) (string, error) {
+	publicKey, err := readCanonicalPublicKey(publicPath)
+	if err == nil {
+		return publicKey, nil
+	}
+	if !os.IsNotExist(err) {
+		return "", err
+	}
+
+	privateData, readErr := os.ReadFile(privatePath)
+	if readErr != nil {
+		return "", fmt.Errorf("read private key to derive public key: %w", readErr)
+	}
+	signer, parseErr := gossh.ParsePrivateKey(privateData)
+	if parseErr != nil {
+		return "", fmt.Errorf("parse private key to derive public key: %w", parseErr)
+	}
+	publicKey = strings.TrimSpace(string(gossh.MarshalAuthorizedKey(signer.PublicKey())))
+	if err := os.MkdirAll(filepath.Dir(publicPath), 0700); err != nil {
+		return "", fmt.Errorf("create public key directory: %w", err)
+	}
+	if err := os.WriteFile(publicPath, []byte(publicKey+"\n"), 0644); err != nil {
+		return "", fmt.Errorf("write derived public key: %w", err)
+	}
+	return publicKey, nil
 }
 
 func expandUserPath(path string) (string, error) {

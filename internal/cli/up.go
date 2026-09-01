@@ -143,7 +143,7 @@ func runUpWithConfig(ctx context.Context, cfg *config.Config, launchMode vscode.
 	if err != nil {
 		return err
 	}
-	ok("SSH host: %s", sshCfg.Host)
+	ok("SSH access: %s", sshCfg.Host)
 
 	idleRefresher, err := maybeConfigureIdleLease(ctx, cfg, prov, sshCfg, leaseOpts)
 	if err != nil {

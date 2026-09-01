@@ -2,8 +2,10 @@ package azure
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -12,6 +14,7 @@ import (
 	"github.com/mutapod/mutapod/internal/config"
 	"github.com/mutapod/mutapod/internal/provider"
 	"github.com/mutapod/mutapod/internal/shell"
+	"github.com/mutapod/mutapod/internal/sshkey"
 	"github.com/mutapod/mutapod/internal/sshrun"
 )
 
@@ -86,15 +89,7 @@ func TestState_NotFound(t *testing.T) {
 }
 
 func TestEnsureInstance_CreateNew(t *testing.T) {
-	home := tempHome(t)
-	privateKey := filepath.Join(home, ".ssh", "id_rsa")
-	publicKey := privateKey + ".pub"
-	if err := os.MkdirAll(filepath.Dir(privateKey), 0700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(publicKey, []byte("ssh-ed25519 test"), 0600); err != nil {
-		t.Fatal(err)
-	}
+	tempHome(t)
 
 	f := shell.NewFakeCommander()
 	cfg := testConfig()
@@ -114,6 +109,10 @@ func TestEnsureInstance_CreateNew(t *testing.T) {
 	)
 
 	p := New(cfg, f)
+	identity, err := p.sshIdentity(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	_, _ = p.EnsureInstance(ctx)
@@ -132,7 +131,7 @@ func TestEnsureInstance_CreateNew(t *testing.T) {
 		"--public-ip-address", "",
 		"--nsg-rule", "NONE",
 		"--location", "westeurope",
-		"--ssh-key-values", "@"+publicKey,
+		"--ssh-key-values", "@"+identity.PublicPath,
 		"--vnet-name", "dev-vnet",
 		"--subnet", "dev-subnet",
 		"--tags", "managed-by=mutapod", "mutapod-config="+fingerprint,
@@ -147,15 +146,7 @@ func TestEnsureInstance_CreateNew(t *testing.T) {
 }
 
 func TestEnsureInstance_CreateNewWithPublicIP(t *testing.T) {
-	home := tempHome(t)
-	privateKey := filepath.Join(home, ".ssh", "id_rsa")
-	publicKey := privateKey + ".pub"
-	if err := os.MkdirAll(filepath.Dir(privateKey), 0700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(publicKey, []byte("ssh-ed25519 test"), 0600); err != nil {
-		t.Fatal(err)
-	}
+	tempHome(t)
 
 	cfg := testConfig()
 	cfg.Provider.Azure.PublicIP = true
@@ -177,6 +168,10 @@ func TestEnsureInstance_CreateNewWithPublicIP(t *testing.T) {
 	)
 
 	p := New(cfg, f)
+	identity, err := p.sshIdentity(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	_, _ = p.EnsureInstance(ctx)
@@ -195,7 +190,7 @@ func TestEnsureInstance_CreateNewWithPublicIP(t *testing.T) {
 		"--public-ip-sku", "Standard",
 		"--nsg-rule", "SSH",
 		"--location", "westeurope",
-		"--ssh-key-values", "@"+publicKey,
+		"--ssh-key-values", "@"+identity.PublicPath,
 		"--vnet-name", "dev-vnet",
 		"--subnet", "dev-subnet",
 		"--tags", "managed-by=mutapod", "mutapod-config="+fingerprint,
@@ -210,11 +205,7 @@ func TestEnsureInstance_CreateNewWithPublicIP(t *testing.T) {
 }
 
 func TestSSHConfig(t *testing.T) {
-	oldTrustHost := trustHostFunc
-	t.Cleanup(func() {
-		trustHostFunc = oldTrustHost
-	})
-	trustHostFunc = func(client *sshrun.Client, knownHostsFile, hostKeyAlias string) error { return nil }
+	stubSSHFunctions(t, func(context.Context, *sshrun.Client) error { return nil })
 
 	home := tempHome(t)
 	f := shell.NewFakeCommander()
@@ -230,6 +221,10 @@ func TestSSHConfig(t *testing.T) {
 	)
 
 	p := New(testConfig(), f)
+	identity, err := p.sshIdentity(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
 	sshCfg, err := p.SSHConfig(context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -244,7 +239,7 @@ func TestSSHConfig(t *testing.T) {
 	if sshCfg.User != "azureuser" {
 		t.Errorf("User: got %q, want azureuser", sshCfg.User)
 	}
-	if sshCfg.IdentityFile != filepath.Join(home, ".ssh", "id_rsa") {
+	if sshCfg.IdentityFile != identity.PrivatePath {
 		t.Errorf("IdentityFile: got %q", sshCfg.IdentityFile)
 	}
 
@@ -257,7 +252,7 @@ func TestSSHConfig(t *testing.T) {
 		"Host " + instanceName + ".azure",
 		"HostName 10.1.2.3",
 		"User azureuser",
-		"IdentityFile " + filepath.ToSlash(filepath.Join(home, ".ssh", "id_rsa")),
+		"IdentityFile " + filepath.ToSlash(identity.PrivatePath),
 		"UserKnownHostsFile " + filepath.ToSlash(filepath.Join(home, ".ssh", "known_hosts")),
 		"HostKeyAlias " + instanceName + ".azure",
 	} {
@@ -268,11 +263,7 @@ func TestSSHConfig(t *testing.T) {
 }
 
 func TestSSHConfigPreferPrivateIP(t *testing.T) {
-	oldTrustHost := trustHostFunc
-	t.Cleanup(func() {
-		trustHostFunc = oldTrustHost
-	})
-	trustHostFunc = func(client *sshrun.Client, knownHostsFile, hostKeyAlias string) error { return nil }
+	stubSSHFunctions(t, func(context.Context, *sshrun.Client) error { return nil })
 
 	tempHome(t)
 	cfg := testConfig()
@@ -300,10 +291,94 @@ func TestSSHConfigPreferPrivateIP(t *testing.T) {
 	}
 }
 
+func TestSSHConfigRepairsRejectedManagedKey(t *testing.T) {
+	tempHome(t)
+	attempts := 0
+	stubSSHFunctions(t, func(context.Context, *sshrun.Client) error {
+		attempts++
+		if attempts == 1 {
+			return errors.New("ssh: handshake failed: ssh: unable to authenticate, attempted methods [none publickey], no supported methods remain")
+		}
+		return nil
+	})
+
+	cfg := testConfig()
+	f := shell.NewFakeCommander()
+	instanceName := cfg.InstanceName()
+	f.Stub("10.1.2.3\n", "az",
+		"vm", "show",
+		"--resource-group", "rg-dev",
+		"--name", instanceName,
+		"--show-details",
+		"--query", "privateIps",
+		"--output", "tsv",
+		"--subscription", "sub-123",
+	)
+
+	p := New(cfg, f)
+	identity, err := p.sshIdentity(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.SSHConfig(context.Background()); err != nil {
+		t.Fatalf("SSHConfig: %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("SSH probe attempts: got %d, want 2", attempts)
+	}
+
+	wantKey := base64.StdEncoding.EncodeToString([]byte(identity.PublicKey))
+	if !f.CalledWith("az",
+		"vm", "run-command", "invoke",
+		"--resource-group", "rg-dev",
+		"--name", instanceName,
+		"--command-id", "RunShellScript",
+		"--scripts", azureAuthorizedKeysScript,
+		"--parameters", "azureuser", wantKey, identity.Marker,
+		"--output", "none",
+		"--subscription", "sub-123",
+	) {
+		t.Fatalf("expected Azure Run Command key repair, got %#v", f.Calls)
+	}
+}
+
+func TestSSHConfigDoesNotRepairNonAuthenticationFailure(t *testing.T) {
+	tempHome(t)
+	stubSSHFunctions(t, func(context.Context, *sshrun.Client) error {
+		return errors.New("sshrun: parse private key: invalid format")
+	})
+
+	cfg := testConfig()
+	f := shell.NewFakeCommander()
+	f.Stub("10.1.2.3\n", "az",
+		"vm", "show",
+		"--resource-group", "rg-dev",
+		"--name", cfg.InstanceName(),
+		"--show-details",
+		"--query", "privateIps",
+		"--output", "tsv",
+		"--subscription", "sub-123",
+	)
+
+	_, err := New(cfg, f).SSHConfig(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "verify SSH access") {
+		t.Fatalf("expected SSH verification error, got %v", err)
+	}
+	for _, call := range f.Calls {
+		if call.Name == "az" && len(call.Args) >= 3 && call.Args[0] == "vm" && call.Args[1] == "run-command" {
+			t.Fatalf("non-authentication failure triggered key repair: %#v", call)
+		}
+	}
+}
+
 func TestExecTtyUsesAzureSSH(t *testing.T) {
 	tempHome(t)
 	f := shell.NewFakeCommander()
 	p := New(testConfig(), f)
+	identity, err := p.sshIdentity(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if err := p.Exec(context.Background(), nil, provider.ExecOptions{Tty: true}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -313,13 +388,40 @@ func TestExecTtyUsesAzureSSH(t *testing.T) {
 		"--resource-group", "rg-dev",
 		"--name", testConfig().InstanceName(),
 		"--local-user", "azureuser",
-		"--private-key-file", filepath.Join(os.Getenv("HOME"), ".ssh", "id_rsa"),
+		"--private-key-file", identity.PrivatePath,
 		"--subscription", "sub-123",
 	) {
 		t.Error("expected az ssh vm to be called")
 		for _, c := range f.Calls {
 			t.Logf("  call: %s %v", c.Name, c.Args)
 		}
+	}
+}
+
+func TestSSHIdentityPreservesExplicitPrivateKeyAndDerivesMissingPublicKey(t *testing.T) {
+	tempHome(t)
+	pair, err := sshkey.EnsureManaged("test", "source-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(pair.PublicPath); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := testConfig()
+	cfg.Provider.Azure.SSHPrivateKeyFile = pair.PrivatePath
+	identity, err := New(cfg, shell.NewFakeCommander()).sshIdentity(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if identity.PrivatePath != pair.PrivatePath || identity.PublicPath != pair.PublicPath {
+		t.Fatalf("explicit key paths changed: %#v", identity)
+	}
+	if identity.PublicKey != pair.PublicKey {
+		t.Fatal("derived public key does not match explicit private key")
+	}
+	if _, err := os.Stat(pair.PublicPath); err != nil {
+		t.Fatalf("derived public key was not written: %v", err)
 	}
 }
 
@@ -429,6 +531,87 @@ func TestIsSSHStartupErrorTreatsWindowsConnectTimeoutAsTransient(t *testing.T) {
 	err := errors.New("sshrun: connect to capture host key: dial tcp 10.150.170.36:22: connectex: A connection attempt failed because the connected party did not properly respond after a period of time")
 	if !isSSHStartupError(err) {
 		t.Fatalf("expected Windows connect timeout to be transient")
+	}
+}
+
+func TestIsRunCommandRetryable(t *testing.T) {
+	if !isRunCommandRetryable(errors.New("Conflict: Run command extension execution is in progress")) {
+		t.Fatal("expected active Run Command conflict to be retryable")
+	}
+	if isRunCommandRetryable(errors.New("AuthorizationFailed")) {
+		t.Fatal("authorization failure must not be retryable")
+	}
+}
+
+func TestAuthorizedKeysScriptPreservesUnrelatedKeysAndIsIdempotent(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash is not available")
+	}
+
+	root := t.TempDir()
+	home := filepath.Join(root, "home")
+	bin := filepath.Join(root, "bin")
+	sshDir := filepath.Join(home, ".ssh")
+	if err := os.MkdirAll(sshDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(bin, 0700); err != nil {
+		t.Fatal(err)
+	}
+	marker := "mutapod-test-client-target"
+	authorizedKeys := filepath.Join(sshDir, "authorized_keys")
+	initial := "ssh-ed25519 AAAAunrelated admin-key\nssh-ed25519 AAAAstale " + marker + "\n"
+	if err := os.WriteFile(authorizedKeys, []byte(initial), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	writeExecutable(t, filepath.Join(bin, "getent"), "#!/bin/sh\nprintf 'test:x:1000:1000::%s:/bin/sh\\n' \"$MUTAPOD_TEST_HOME\"\n")
+	writeExecutable(t, filepath.Join(bin, "id"), "#!/bin/sh\nprintf 'testgroup\\n'\n")
+	writeExecutable(t, filepath.Join(bin, "chown"), "#!/bin/sh\nexit 0\n")
+	writeExecutable(t, filepath.Join(bin, "install"), "#!/bin/sh\nfor arg do target=\"$arg\"; done\nmkdir -p \"$target\"\nchmod 700 \"$target\"\n")
+
+	publicKey := "ssh-ed25519 AAAAcurrent"
+	encoded := base64.StdEncoding.EncodeToString([]byte(publicKey))
+	scriptPath := filepath.Join("scripts", "ensure_authorized_key.sh")
+	absoluteScriptPath, err := filepath.Abs(scriptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for run := 0; run < 2; run++ {
+		command := "PATH=" + shellTestQuote(bashPath(bash, bin)+":/usr/bin:/bin") +
+			"; export PATH; MUTAPOD_TEST_HOME=" + shellTestQuote(bashPath(bash, home)) +
+			"; export MUTAPOD_TEST_HOME; " + shellTestQuote(bashPath(bash, absoluteScriptPath)) +
+			" test " + shellTestQuote(encoded) + " " + shellTestQuote(marker)
+		args := []string{"-c", command}
+		executable := bash
+		if isWSLBash(bash) {
+			wsl, err := exec.LookPath("wsl")
+			if err != nil {
+				t.Skip("WSL launcher is not available")
+			}
+			executable = wsl
+			args = append([]string{"--", "bash"}, args...)
+		}
+		cmd := exec.Command(executable, args...)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("run authorized_keys script: %v\n%s", err, output)
+		}
+	}
+
+	data, err := os.ReadFile(authorizedKeys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	if !strings.Contains(text, "ssh-ed25519 AAAAunrelated admin-key") {
+		t.Fatalf("unrelated key was removed:\n%s", text)
+	}
+	if strings.Contains(text, "AAAAstale") {
+		t.Fatalf("stale managed key was preserved:\n%s", text)
+	}
+	if strings.Count(text, publicKey+" "+marker) != 1 {
+		t.Fatalf("managed key is not idempotent:\n%s", text)
 	}
 }
 
@@ -543,4 +726,43 @@ func tempHome(t *testing.T) string {
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
 	return home
+}
+
+func stubSSHFunctions(t *testing.T, probe func(context.Context, *sshrun.Client) error) {
+	t.Helper()
+	oldTrustHost := trustHostFunc
+	oldProbeSSH := probeSSHFunc
+	trustHostFunc = func(client *sshrun.Client, knownHostsFile, hostKeyAlias string) error { return nil }
+	probeSSHFunc = probe
+	t.Cleanup(func() {
+		trustHostFunc = oldTrustHost
+		probeSSHFunc = oldProbeSSH
+	})
+}
+
+func writeExecutable(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func bashPath(bash, path string) string {
+	path = filepath.ToSlash(path)
+	if len(path) >= 3 && path[1] == ':' && path[2] == '/' {
+		prefix := "/"
+		if isWSLBash(bash) {
+			prefix = "/mnt/"
+		}
+		return prefix + strings.ToLower(path[:1]) + path[2:]
+	}
+	return path
+}
+
+func isWSLBash(bash string) bool {
+	return strings.Contains(strings.ToLower(filepath.ToSlash(bash)), "/windows/system32/")
+}
+
+func shellTestQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
 }

@@ -98,7 +98,10 @@ internal/
   provider/                 Provider interface + registry
     gcp/gcp.go              GCP impl: gcloud + pure-Go SSH
     azure/azure.go          Azure impl: az + generated SSH config alias +
-                            pure-Go SSH
+                            managed-key repair + pure-Go SSH
+
+  sshkey/                   per-target Ed25519 key generation, locking,
+                            rotation, and stable client markers
 
   sshrun/                   pure-Go SSH client
                             — Run(ctx,cmd,stdin,stdout,stderr) with
@@ -205,9 +208,12 @@ specialised package.
 10. prov.SSHConfig(ctx)                      — provider-specific SSH setup:
                                                GCP runs config-ssh and parses
                                                the generated entry; Azure
-                                               queries VM IP and writes its own
-                                               Host block; both TrustHost()
-                                               for noninteractive access
+                                               ensures a managed per-VM key,
+                                               queries VM IP, writes its Host
+                                               block, trusts the host key, and
+                                               verifies authentication; a
+                                               rejected Azure key is repaired
+                                               through Azure Run Command
 11. activeProfilesForLaunchMode(...)         — detect codex/claude for attached
                                                and local modes; return no
                                                profiles in headless mode
@@ -336,11 +342,12 @@ to match.
 Local (per-workspace, on the developer's machine):
 - `~/.mutapod/state/<name>.json` — JSON state file (`internal/state/state.go`)
 - `~/.mutapod/heartbeat/<name>.lock` — flock for the local heartbeat process
+- `~/.mutapod/client-id` — stable local client identifier for managed SSH keys
+- `~/.mutapod/keys/azure/<target>/id_ed25519` — per-VM Azure SSH key
 - `~/.mutapod/profile-links/claude-homefile/claude.json` — hard link target
   bridging `~/.claude.json` into a Mutagen-syncable directory
 - `~/.mutapod/bin/mutagen` — auto-downloaded mutagen binary
 - `~/.ssh/google_compute_engine` — gcloud-managed private key
-- `~/.ssh/id_rsa` or configured Azure key — Azure SSH private key
 - `~/.ssh/google_compute_known_hosts` — populated by `sshrun.TrustHost`
 - `~/.ssh/known_hosts` — populated by `sshrun.TrustHost` for Azure aliases
 - `~/.ssh/config` — populated by `gcloud compute config-ssh`; mutapod *parses*
@@ -379,6 +386,7 @@ ends up here.
 | **GCP SSH username** | gcloud doesn't honour the `remote_user` from mutapod.yaml — it provisions keys for the *local* OS user (lowercased, with `DOMAIN\` stripped on Windows). `gcpSSHUsername()` derives this; the parsed `User` from `~/.ssh/config` takes precedence when present. |
 | **Azure private-only default** | Azure VM creation passes `--public-ip-address "" --nsg-rule NONE` unless `provider.azure.public_ip: true` is set. SSH uses the VM private IP by default, so the local machine must have private routing to the target subnet. |
 | **Azure SSH alias** | Azure does not need `az ssh config` for mutapod's noninteractive path. `provider/azure` writes `Host <instance>.azure` with `HostName`, `IdentityFile`, `UserKnownHostsFile`, and `HostKeyAlias`, then trusts the host key in `~/.ssh/known_hosts`. `TrustHost` must replace a stale entry for that alias after VM recreation; merely detecting that the alias already exists leaves Mutagen blocked by OpenSSH host-key verification. |
+| **Azure managed SSH recovery** | Default Azure identities are dedicated Ed25519 pairs under `~/.mutapod/keys/azure/`, never the user's personal `id_rsa`. New VMs receive the matching public key explicitly. After host-key capture, mutapod probes real authentication; only a public-key rejection triggers an idempotent Azure Run Command that replaces this client's marked `authorized_keys` entry, preserves unrelated keys, and verifies access before launch continues. Network failures never rotate credentials. |
 | **Mutagen text parsing** | v0.18.1 has no JSON output. `parseSyncStatus` and `parseForwardStatus` walk the human-readable lines looking for `Status:` and normalise to a fixed token set. `isNoSessions(err)` recognises the three different "not found" phrasings mutagen has used. |
 | **Session config signature** | `Manager.SessionConfigSignature` hashes the args mutagen would create the session with. When the signature differs from the saved one, the session is terminated and recreated. The version prefix (`v4` currently) is bumped whenever the args list changes structurally; this forces a one-shot recreation on upgrade. |
 | **Declarative VM fingerprint** | `Config.VMConfigFingerprint` hashes a normalized, versioned provider-specific VM spec. GCP stores it in the `mutapod-config` label and Azure in the same-named tag. A mismatch is handled consistently by replacing the VM; legacy VMs can be explicitly adopted. Target project/zone/subscription/resource-group changes preserve the previous VM instead of deleting across scopes. |
